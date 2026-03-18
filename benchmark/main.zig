@@ -283,37 +283,25 @@ fn runPipeline(io: std.Io, conn: *zpg.Conn, sql: []const u8, variant: common.Zpg
     if (count == 0) return;
 
     var pipeline = conn.pipeline(queryOptions(variant));
-    var send_times: []u64 = &.{};
-    if (maybe_samples != null) {
-        send_times = try std.heap.smp_allocator.alloc(u64, count);
-        defer std.heap.smp_allocator.free(send_times);
-    }
-
     var sent: usize = 0;
     var completed: usize = 0;
 
-    while (sent < count and sent - completed < depth) {
-        if (maybe_samples != null) send_times[sent] = monoNowNs();
-        try pipeline.query(sql);
-        sent += 1;
-    }
-    try pipeline.flush();
-
     while (completed < count) {
-        try pipeline.discard();
-        if (maybe_samples) |samples| {
-            samples[completed] = monoNowNs() - send_times[completed];
-        }
-        completed += 1;
-
-        var queued_since_flush: usize = 0;
-        while (sent < count and sent - completed < depth) {
-            if (maybe_samples != null) send_times[sent] = monoNowNs();
+        const batch_end = @min(sent + depth, count);
+        while (sent < batch_end) {
+            if (maybe_samples) |samples| samples[sent] = monoNowNs();
             try pipeline.query(sql);
             sent += 1;
-            queued_since_flush += 1;
         }
-        if (queued_since_flush != 0) try pipeline.flush();
+        try pipeline.flush();
+
+        while (completed < batch_end) {
+            try pipeline.discard();
+            if (maybe_samples) |samples| {
+                samples[completed] = monoNowNs() - samples[completed];
+            }
+            completed += 1;
+        }
     }
 }
 

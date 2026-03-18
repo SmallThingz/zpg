@@ -43,6 +43,70 @@ pub const QueryOptions = struct {
     result_format: proto.FormatCode = .text,
 };
 
+pub fn CompiledResult(comptime RowT: type) type {
+    return struct {
+        raw: Result,
+        rows: []const RowT,
+
+        pub fn deinit(result: *@This()) void {
+            result.raw.deinit();
+            result.* = undefined;
+        }
+    };
+}
+
+pub fn CompiledQuery(comptime sql_text: []const u8, comptime Args: type, comptime RowT: type) type {
+    comptime validateCompiledQuerySpec(sql_text, Args, RowT);
+
+    return struct {
+        pub const sql = sql_text;
+        pub const Params = Args;
+        pub const Row = RowT;
+        pub const protocol = inferCompiledProtocol(sql_text, Args);
+
+        pub fn query(conn: *Conn, allocator: std.mem.Allocator, args: Args) !CompiledResult(RowT) {
+            const raw = try runRawQuery(conn, allocator, args);
+            return materializeCompiledResult(RowT, raw);
+        }
+
+        pub fn exec(conn: *Conn, allocator: std.mem.Allocator, args: Args) ![]const u8 {
+            return switch (protocol) {
+                .simple => conn.execOpts(allocator, sql_text, .{
+                    .protocol = .simple,
+                    .result_format = .text,
+                }),
+                .extended => blk: {
+                    var scratch = std.heap.ArenaAllocator.init(allocator);
+                    defer scratch.deinit();
+                    const params = try encodeCompiledParams(scratch.allocator(), args);
+                    break :blk conn.execExtendedRaw(allocator, sql_text, params, .{
+                        .protocol = .extended,
+                        .result_format = .text,
+                    });
+                },
+            };
+        }
+
+        fn runRawQuery(conn: *Conn, allocator: std.mem.Allocator, args: Args) !Result {
+            return switch (protocol) {
+                .simple => conn.queryOpts(allocator, sql_text, .{
+                    .protocol = .simple,
+                    .result_format = .text,
+                }),
+                .extended => blk: {
+                    var scratch = std.heap.ArenaAllocator.init(allocator);
+                    defer scratch.deinit();
+                    const params = try encodeCompiledParams(scratch.allocator(), args);
+                    break :blk conn.queryExtendedRaw(allocator, sql_text, params, .{
+                        .protocol = .extended,
+                        .result_format = .text,
+                    });
+                },
+            };
+        }
+    };
+}
+
 pub const Row = struct {
     values: []const ?[]const u8,
 
@@ -130,6 +194,9 @@ pub const Pipeline = struct {
     conn: *Conn,
     opts: QueryOptions,
     pending: usize = 0,
+    pending_in_batch: usize = 0,
+    queued_since_flush: usize = 0,
+    next_portal_id: u64 = 0,
 
     pub fn init(conn: *Conn, opts: QueryOptions) Pipeline {
         return .{
@@ -142,11 +209,15 @@ pub const Pipeline = struct {
         switch (pipeline.opts.protocol) {
             .simple => {
                 if (pipeline.opts.result_format != .text) return error.UnsupportedResultFormat;
-                try pipeline.conn.queueSimpleQuery(sql);
+                try pipeline.conn.queuePipelineSimpleQuery(sql);
             },
-            .extended => try pipeline.conn.queueExtendedQuery("", sql, &.{}, pipeline.opts.result_format, true),
+            .extended => {
+                try pipeline.conn.queuePipelineCachedQuery(sql, pipeline.opts.result_format, pipeline.next_portal_id);
+                pipeline.next_portal_id += 1;
+            },
         }
         pipeline.pending += 1;
+        pipeline.queued_since_flush += 1;
     }
 
     pub fn queryValues(pipeline: *Pipeline, allocator: std.mem.Allocator, sql: []const u8, values: []const Value) !void {
@@ -178,33 +249,64 @@ pub const Pipeline = struct {
     }
 
     pub fn flush(pipeline: *Pipeline) !void {
-        try pipeline.conn.flushPendingWrites();
+        if (pipeline.pending_in_batch != 0) return error.PendingResults;
+        if (pipeline.queued_since_flush == 0) return;
+        switch (pipeline.opts.protocol) {
+            .simple => try pipeline.conn.flushPipelineSimpleQueries(),
+            .extended => {
+                try proto.appendSync(&pipeline.conn.queued_writes, pipeline.conn.allocator);
+                try pipeline.conn.flushPendingWrites();
+            },
+        }
+        pipeline.pending_in_batch = pipeline.queued_since_flush;
+        pipeline.queued_since_flush = 0;
     }
 
     pub fn readQuery(pipeline: *Pipeline, allocator: std.mem.Allocator) !Result {
         if (pipeline.pending == 0) return error.NoPendingResults;
+        if (pipeline.pending_in_batch == 0) return error.PendingFlush;
         pipeline.pending -= 1;
         return switch (pipeline.opts.protocol) {
-            .simple => pipeline.conn.readSimpleQueryResult(allocator),
-            .extended => pipeline.conn.readQueryResult(allocator, true),
+            .simple => blk: {
+                pipeline.pending_in_batch -= 1;
+                break :blk pipeline.conn.readPipelineSimpleQueryResult(allocator, pipeline.pending_in_batch == 0);
+            },
+            .extended => blk: {
+                pipeline.pending_in_batch -= 1;
+                break :blk pipeline.conn.readPipelineQueryResult(allocator, pipeline.pending_in_batch == 0);
+            },
         };
     }
 
     pub fn readExec(pipeline: *Pipeline, allocator: std.mem.Allocator) ![]const u8 {
         if (pipeline.pending == 0) return error.NoPendingResults;
+        if (pipeline.pending_in_batch == 0) return error.PendingFlush;
         pipeline.pending -= 1;
         return switch (pipeline.opts.protocol) {
-            .simple => pipeline.conn.readSimpleExecResult(allocator),
-            .extended => pipeline.conn.readExecResult(allocator, true),
+            .simple => blk: {
+                pipeline.pending_in_batch -= 1;
+                break :blk pipeline.conn.readPipelineSimpleExecResult(allocator, pipeline.pending_in_batch == 0);
+            },
+            .extended => blk: {
+                pipeline.pending_in_batch -= 1;
+                break :blk pipeline.conn.readPipelineExecResult(allocator, pipeline.pending_in_batch == 0);
+            },
         };
     }
 
     pub fn discard(pipeline: *Pipeline) !void {
         if (pipeline.pending == 0) return error.NoPendingResults;
+        if (pipeline.pending_in_batch == 0) return error.PendingFlush;
         pipeline.pending -= 1;
         return switch (pipeline.opts.protocol) {
-            .simple => pipeline.conn.discardSimpleQueryResult(),
-            .extended => pipeline.conn.discardExtendedResult(),
+            .simple => {
+                pipeline.pending_in_batch -= 1;
+                try pipeline.conn.discardPipelineSimpleQueryResult(pipeline.pending_in_batch == 0);
+            },
+            .extended => {
+                pipeline.pending_in_batch -= 1;
+                try pipeline.conn.discardPipelineExtendedResult(pipeline.pending_in_batch == 0);
+            },
         };
     }
 };
@@ -236,6 +338,7 @@ pub const Conn = struct {
     read_buffer: []u8,
     write_buffer: []u8,
     queued_writes: std.ArrayList(u8) = .empty,
+    queued_simple_pipeline_sql: std.ArrayList(u8) = .empty,
     tls: ?*TlsState = null,
     message_buffer: []u8 = &.{},
     backend_pid: i32 = 0,
@@ -246,6 +349,8 @@ pub const Conn = struct {
     next_statement_id: u64 = 0,
     unnamed_statement_sql: []u8 = &.{},
     unnamed_statement_param_types: []u32 = &.{},
+    pipeline_statement_sql: []u8 = &.{},
+    simple_pipeline_statement_sql: []u8 = &.{},
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !*Conn {
         return create(allocator, io, config);
@@ -292,6 +397,8 @@ pub const Conn = struct {
         defer conn.* = undefined;
         if (conn.last_error) |*err| err.deinit(allocator);
         conn.clearUnnamedStatementCache();
+        conn.clearPipelineStatementCache();
+        conn.clearSimplePipelineStatementCache();
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
         proto.appendTerminate(&out, allocator) catch {};
@@ -305,6 +412,7 @@ pub const Conn = struct {
         allocator.free(conn.read_buffer);
         allocator.free(conn.write_buffer);
         conn.queued_writes.deinit(allocator);
+        conn.queued_simple_pipeline_sql.deinit(allocator);
     }
 
     pub fn queryAlloc(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) !Result {
@@ -330,7 +438,23 @@ pub const Conn = struct {
         try conn.writeSimpleQueryBuffered(sql);
     }
 
+    pub fn queuePipelineSimpleQuery(conn: *Conn, sql: []const u8) !void {
+        conn.clearLastError();
+        if (conn.simple_pipeline_statement_sql.len != 0) {
+            conn.clearSimplePipelineStatementCache();
+        }
+        try conn.queued_simple_pipeline_sql.appendSlice(conn.allocator, sql);
+        try conn.queued_simple_pipeline_sql.append(conn.allocator, ';');
+    }
+
     pub fn flushPendingWrites(conn: *Conn) !void {
+        try conn.flushWrites();
+    }
+
+    pub fn flushPipelineSimpleQueries(conn: *Conn) !void {
+        if (conn.queued_simple_pipeline_sql.items.len == 0) return;
+        try conn.writeSimpleQueryBuffered(conn.queued_simple_pipeline_sql.items);
+        conn.queued_simple_pipeline_sql.clearRetainingCapacity();
         try conn.flushWrites();
     }
 
@@ -338,22 +462,61 @@ pub const Conn = struct {
         return conn.readQueryResult(allocator, false);
     }
 
+    pub fn readPipelineSimpleQueryResult(conn: *Conn, allocator: std.mem.Allocator, expect_ready: bool) !Result {
+        return conn.readQueryResultMode(allocator, false, expect_ready);
+    }
+
     pub fn readSimpleExecResult(conn: *Conn, allocator: std.mem.Allocator) ![]const u8 {
         return conn.readExecResult(allocator, false);
+    }
+
+    pub fn readPipelineSimpleExecResult(conn: *Conn, allocator: std.mem.Allocator, expect_ready: bool) ![]const u8 {
+        return conn.readExecResultMode(allocator, false, expect_ready);
     }
 
     pub fn discardSimpleQueryResult(conn: *Conn) !void {
         var failed = false;
         while (true) {
-            const msg = try conn.readMessage();
+            const msg = try conn.readMessageHeader();
             switch (msg.tag) {
-                'T', 'D', 'C', 'I', 'S', 'N', 'A' => {},
+                'T', 'D', 'C', 'I', 'S', 'N', 'A' => try conn.skipMessagePayload(msg.payload_len),
                 'E' => {
+                    const payload = try conn.readMessagePayload(msg.payload_len);
                     failed = true;
-                    conn.setLastError(msg.payload) catch return conn.protocolError();
+                    conn.setLastError(payload) catch return conn.protocolError();
                 },
                 'Z' => {
-                    try conn.finishReady(msg.payload);
+                    const payload = try conn.readMessagePayload(msg.payload_len);
+                    try conn.finishReady(payload);
+                    if (failed) return error.PgServer;
+                    return;
+                },
+                else => return conn.protocolError(),
+            }
+        }
+    }
+
+    pub fn discardPipelineSimpleQueryResult(conn: *Conn, expect_ready: bool) !void {
+        var failed = false;
+        while (true) {
+            const msg = try conn.readMessageHeader();
+            switch (msg.tag) {
+                'T', 'D', 'S', 'N', 'A' => try conn.skipMessagePayload(msg.payload_len),
+                'C', 'I' => {
+                    try conn.skipMessagePayload(msg.payload_len);
+                    if (!expect_ready) {
+                        if (failed) return error.PgServer;
+                        return;
+                    }
+                },
+                'E' => {
+                    const payload = try conn.readMessagePayload(msg.payload_len);
+                    failed = true;
+                    conn.setLastError(payload) catch return conn.protocolError();
+                },
+                'Z' => {
+                    const payload = try conn.readMessagePayload(msg.payload_len);
+                    try conn.finishReady(payload);
                     if (failed) return error.PgServer;
                     return;
                 },
@@ -366,17 +529,21 @@ pub const Conn = struct {
         var failed = false;
         var saw_extended_control = false;
         while (true) {
-            const msg = try conn.readMessage();
+            const msg = try conn.readMessageHeader();
             switch (msg.tag) {
-                '1', '2' => saw_extended_control = true,
-                'T', 'D', 'C', 'I', 'n', 'S', 'N' => {},
-                't', 'A', 's' => {},
+                '1', '2' => {
+                    saw_extended_control = true;
+                    try conn.skipMessagePayload(msg.payload_len);
+                },
+                'T', 'D', 'C', 'I', 'n', 'S', 'N', 't', 'A', 's' => try conn.skipMessagePayload(msg.payload_len),
                 'E' => {
+                    const payload = try conn.readMessagePayload(msg.payload_len);
                     failed = true;
-                    conn.setLastError(msg.payload) catch return conn.protocolError();
+                    conn.setLastError(payload) catch return conn.protocolError();
                 },
                 'Z' => {
-                    try conn.finishReady(msg.payload);
+                    const payload = try conn.readMessagePayload(msg.payload_len);
+                    try conn.finishReady(payload);
                     if (!saw_extended_control) return conn.protocolError();
                     if (failed) return error.PgServer;
                     return;
@@ -579,13 +746,55 @@ pub const Conn = struct {
             }
         }
         if (need_parse) {
-            try proto.appendParse(&out, conn.allocator, statement_name, sql, param_types);
+            const parse_param_types = if (cache_unnamed) &.{} else param_types;
+            try proto.appendParse(&out, conn.allocator, statement_name, sql, parse_param_types);
             if (cache_unnamed) try conn.updateUnnamedStatementCache(sql, param_types);
         }
         try proto.appendBind(&out, conn.allocator, "", statement_name, params, result_format);
         try proto.appendExecute(&out, conn.allocator, "", 0);
         try proto.appendSync(&out, conn.allocator);
         try conn.queueMessages(out.items);
+    }
+
+    fn queuePipelineExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, params: []const proto.Param, result_format: proto.FormatCode, include_parse: bool) !void {
+        var out = try std.ArrayList(u8).initCapacity(conn.allocator, extendedQueryMessageLen(statement_name, sql, params, include_parse) - syncMessageLen());
+        defer out.deinit(conn.allocator);
+        const cache_unnamed = statement_name.len == 0 and include_parse;
+        var param_types: []u32 = &.{};
+        var need_parse = include_parse;
+        if (include_parse) {
+            param_types = try collectParamTypes(conn.allocator, params);
+            defer conn.allocator.free(param_types);
+            if (cache_unnamed) {
+                need_parse = !conn.matchesUnnamedStatement(sql, param_types);
+            }
+        }
+        if (need_parse) {
+            try proto.appendParse(&out, conn.allocator, statement_name, sql, param_types);
+            if (cache_unnamed) try conn.updateUnnamedStatementCache(sql, param_types);
+        }
+        try proto.appendBind(&out, conn.allocator, "", statement_name, params, result_format);
+        try proto.appendExecute(&out, conn.allocator, "", 0);
+        try conn.queueMessages(out.items);
+    }
+
+    fn queuePipelineCachedQuery(conn: *Conn, sql: []const u8, result_format: proto.FormatCode, portal_id: u64) !void {
+        const statement_name = "s";
+        var portal_buf: [18]u8 = undefined;
+        const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
+
+        const needs_parse = !std.mem.eql(u8, conn.pipeline_statement_sql, sql);
+        if (needs_parse and conn.pipeline_statement_sql.len != 0) {
+            try proto.appendClose(&conn.queued_writes, conn.allocator, .statement, statement_name);
+        }
+        if (needs_parse) {
+            try proto.appendParse(&conn.queued_writes, conn.allocator, statement_name, sql, &.{});
+            conn.clearPipelineStatementCache();
+            conn.pipeline_statement_sql = try conn.allocator.dupe(u8, sql);
+        }
+
+        try proto.appendBind(&conn.queued_writes, conn.allocator, portal_name, statement_name, &.{}, result_format);
+        try proto.appendExecute(&conn.queued_writes, conn.allocator, portal_name, 0);
     }
 
     fn sendExtendedExecute(conn: *Conn, statement_name: []const u8, params: []const proto.Param, result_format: proto.FormatCode) !void {
@@ -603,6 +812,14 @@ pub const Conn = struct {
     }
 
     fn readQueryResult(conn: *Conn, allocator: std.mem.Allocator, extended: bool) !Result {
+        return conn.readQueryResultMode(allocator, extended, true);
+    }
+
+    fn readPipelineQueryResult(conn: *Conn, allocator: std.mem.Allocator, expect_ready: bool) !Result {
+        return conn.readQueryResultMode(allocator, true, expect_ready);
+    }
+
+    fn readQueryResultMode(conn: *Conn, allocator: std.mem.Allocator, extended: bool, expect_ready: bool) !Result {
         var result = Result{ .arena = std.heap.ArenaAllocator.init(allocator) };
         errdefer result.deinit();
         const arena = result.arena.allocator();
@@ -620,13 +837,32 @@ pub const Conn = struct {
                 '1', '2' => saw_extended_control = true,
                 'T' => try parseRowDescription(arena, &columns, msg.payload),
                 'D' => try rows.append(arena, try parseDataRow(arena, msg.payload)),
-                'C' => command_tag = try arena.dupe(u8, try parseCommandComplete(msg.payload)),
-                'I', 'n', 't', 'A', 's' => {},
+                'C' => {
+                    command_tag = try arena.dupe(u8, try parseCommandComplete(msg.payload));
+                    if (!expect_ready) {
+                        if (!saw_extended_control) return conn.protocolError();
+                        result.columns = try columns.toOwnedSlice(arena);
+                        result.rows = try rows.toOwnedSlice(arena);
+                        result.command_tag = command_tag;
+                        if (failed) return error.PgServer;
+                        return result;
+                    }
+                },
+                '3', 'n', 't', 'A', 's', 'S', 'N' => {},
+                'I' => {
+                    if (!expect_ready) {
+                        if (!saw_extended_control) return conn.protocolError();
+                        result.columns = try columns.toOwnedSlice(arena);
+                        result.rows = try rows.toOwnedSlice(arena);
+                        result.command_tag = command_tag;
+                        if (failed) return error.PgServer;
+                        return result;
+                    }
+                },
                 'E' => {
                     failed = true;
                     conn.setLastError(msg.payload) catch return conn.protocolError();
                 },
-                'S', 'N' => {},
                 'Z' => {
                     try conn.finishReady(msg.payload);
                     if (!saw_extended_control) return conn.protocolError();
@@ -642,6 +878,14 @@ pub const Conn = struct {
     }
 
     fn readExecResult(conn: *Conn, allocator: std.mem.Allocator, extended: bool) ![]const u8 {
+        return conn.readExecResultMode(allocator, extended, true);
+    }
+
+    fn readPipelineExecResult(conn: *Conn, allocator: std.mem.Allocator, expect_ready: bool) ![]const u8 {
+        return conn.readExecResultMode(allocator, true, expect_ready);
+    }
+
+    fn readExecResultMode(conn: *Conn, allocator: std.mem.Allocator, extended: bool, expect_ready: bool) ![]const u8 {
         var command_tag: ?[]const u8 = null;
         var failed = false;
         var saw_extended_control = !extended;
@@ -649,8 +893,22 @@ pub const Conn = struct {
             const msg = try conn.readMessage();
             switch (msg.tag) {
                 '1', '2' => saw_extended_control = true,
-                'C' => command_tag = try allocator.dupe(u8, try parseCommandComplete(msg.payload)),
-                'T', 'D', 'I', 'n', 'S', 'N', 't', 'A', 's' => {},
+                'C' => {
+                    command_tag = try allocator.dupe(u8, try parseCommandComplete(msg.payload));
+                    if (!expect_ready) {
+                        if (!saw_extended_control) return conn.protocolError();
+                        if (failed) return error.PgServer;
+                        return command_tag.?;
+                    }
+                },
+                'T', 'D', '3', 'n', 'S', 'N', 't', 'A', 's' => {},
+                'I' => {
+                    if (!expect_ready) {
+                        if (!saw_extended_control) return conn.protocolError();
+                        if (failed) return error.PgServer;
+                        return command_tag orelse try allocator.dupe(u8, "");
+                    }
+                },
                 'E' => {
                     failed = true;
                     conn.setLastError(msg.payload) catch return conn.protocolError();
@@ -660,6 +918,42 @@ pub const Conn = struct {
                     if (!saw_extended_control) return conn.protocolError();
                     if (failed) return error.PgServer;
                     return command_tag orelse try allocator.dupe(u8, "");
+                },
+                else => return conn.protocolError(),
+            }
+        }
+    }
+
+    fn discardPipelineExtendedResult(conn: *Conn, expect_ready: bool) !void {
+        var failed = false;
+        var saw_extended_control = false;
+        while (true) {
+            const msg = try conn.readMessageHeader();
+            switch (msg.tag) {
+                '1', '2' => {
+                    saw_extended_control = true;
+                    try conn.skipMessagePayload(msg.payload_len);
+                },
+                'T', 'D', '3', 'n', 'S', 'N', 't', 'A', 's' => try conn.skipMessagePayload(msg.payload_len),
+                'C', 'I' => {
+                    try conn.skipMessagePayload(msg.payload_len);
+                    if (!expect_ready) {
+                        if (!saw_extended_control) return conn.protocolError();
+                        if (failed) return error.PgServer;
+                        return;
+                    }
+                },
+                'E' => {
+                    const payload = try conn.readMessagePayload(msg.payload_len);
+                    failed = true;
+                    conn.setLastError(payload) catch return conn.protocolError();
+                },
+                'Z' => {
+                    const payload = try conn.readMessagePayload(msg.payload_len);
+                    try conn.finishReady(payload);
+                    if (!saw_extended_control) return conn.protocolError();
+                    if (failed) return error.PgServer;
+                    return;
                 },
                 else => return conn.protocolError(),
             }
@@ -775,6 +1069,20 @@ pub const Conn = struct {
         }
     }
 
+    fn clearPipelineStatementCache(conn: *Conn) void {
+        if (conn.pipeline_statement_sql.len != 0) {
+            conn.allocator.free(conn.pipeline_statement_sql);
+            conn.pipeline_statement_sql = &.{};
+        }
+    }
+
+    fn clearSimplePipelineStatementCache(conn: *Conn) void {
+        if (conn.simple_pipeline_statement_sql.len != 0) {
+            conn.allocator.free(conn.simple_pipeline_statement_sql);
+            conn.simple_pipeline_statement_sql = &.{};
+        }
+    }
+
     fn matchesUnnamedStatement(conn: *const Conn, sql: []const u8, param_types: []const u32) bool {
         return std.mem.eql(u8, conn.unnamed_statement_sql, sql) and
             std.mem.eql(u32, conn.unnamed_statement_param_types, param_types);
@@ -808,6 +1116,42 @@ pub const Conn = struct {
 
     fn readMessage(conn: *Conn) !proto.MessageView {
         return proto.readMessageInto(conn.allocator, conn.currentReader(), conn.config.max_message_len, &conn.message_buffer);
+    }
+
+    const MessageHeader = struct {
+        tag: u8,
+        payload_len: u32,
+    };
+
+    fn readMessageHeader(conn: *Conn) !MessageHeader {
+        const reader = conn.currentReader();
+        const tag = try reader.takeByte();
+        const len = try reader.takeInt(u32, .big);
+        if (len < 4 or len - 4 > conn.config.max_message_len) return error.InvalidMessageLength;
+        return .{
+            .tag = tag,
+            .payload_len = len - 4,
+        };
+    }
+
+    fn readMessagePayload(conn: *Conn, payload_len: u32) ![]u8 {
+        if (conn.message_buffer.len < payload_len) {
+            if (conn.message_buffer.len != 0) conn.allocator.free(conn.message_buffer);
+            conn.message_buffer = try conn.allocator.alloc(u8, payload_len);
+        }
+        const payload = conn.message_buffer[0..payload_len];
+        try conn.currentReader().readSliceAll(payload);
+        return payload;
+    }
+
+    fn skipMessagePayload(conn: *Conn, payload_len: u32) !void {
+        var remaining: usize = payload_len;
+        var scratch: [256]u8 = undefined;
+        while (remaining != 0) {
+            const chunk_len = @min(remaining, scratch.len);
+            try conn.currentReader().readSliceAll(scratch[0..chunk_len]);
+            remaining -= chunk_len;
+        }
     }
 
     fn currentReader(conn: *Conn) *std.Io.Reader {
@@ -979,6 +1323,226 @@ fn connectStream(config: *const Config, io: std.Io) !std.Io.net.Stream {
 fn networkBufferLen(config: *const Config) usize {
     const base = 16 * 1024;
     return if (config.ssl_mode == .disable) base else @max(base, TlsClient.min_buffer_len);
+}
+
+fn validateCompiledQuerySpec(comptime sql_text: []const u8, comptime Args: type, comptime RowT: type) void {
+    comptime {
+        const expected_params = sqlPlaceholderCount(sql_text);
+        const actual_params = compiledArgCount(Args);
+        if (expected_params != actual_params) {
+            @compileError(std.fmt.comptimePrint(
+                "compiled query placeholder count mismatch for `{s}`: expected {d}, got {d}",
+                .{ sql_text, expected_params, actual_params },
+            ));
+        }
+        switch (@typeInfo(RowT)) {
+            .@"struct" => {},
+            else => @compileError("compiled query row type must be a struct"),
+        }
+    }
+}
+
+fn inferCompiledProtocol(comptime sql_text: []const u8, comptime Args: type) QueryProtocol {
+    _ = Args;
+    return if (sqlPlaceholderCount(sql_text) == 0) .simple else .extended;
+}
+
+fn compiledArgCount(comptime Args: type) usize {
+    return switch (@typeInfo(Args)) {
+        .@"struct" => |info| info.fields.len,
+        else => @compileError("compiled query args must be a tuple or struct"),
+    };
+}
+
+fn sqlPlaceholderCount(comptime sql_text: []const u8) usize {
+    var i: usize = 0;
+    var max_index: usize = 0;
+    while (i < sql_text.len) : (i += 1) {
+        switch (sql_text[i]) {
+            '\'' => i = skipSingleQuoted(sql_text, i),
+            '"' => i = skipDoubleQuoted(sql_text, i),
+            '$' => {
+                if (i + 1 < sql_text.len and std.ascii.isDigit(sql_text[i + 1])) {
+                    var j = i + 1;
+                    var value: usize = 0;
+                    while (j < sql_text.len and std.ascii.isDigit(sql_text[j])) : (j += 1) {
+                        value = value * 10 + (sql_text[j] - '0');
+                    }
+                    if (value > max_index) max_index = value;
+                    i = j - 1;
+                    continue;
+                }
+                if (dollarQuoteTagLen(sql_text, i)) |tag_len| {
+                    i = skipDollarQuoted(sql_text, i, tag_len);
+                }
+            },
+            else => {},
+        }
+    }
+    return max_index;
+}
+
+fn skipSingleQuoted(comptime text: []const u8, start: usize) usize {
+    var i = start + 1;
+    while (i < text.len) : (i += 1) {
+        if (text[i] != '\'') continue;
+        if (i + 1 < text.len and text[i + 1] == '\'') {
+            i += 1;
+            continue;
+        }
+        return i;
+    }
+    return text.len;
+}
+
+fn skipDoubleQuoted(comptime text: []const u8, start: usize) usize {
+    var i = start + 1;
+    while (i < text.len) : (i += 1) {
+        if (text[i] != '"') continue;
+        if (i + 1 < text.len and text[i + 1] == '"') {
+            i += 1;
+            continue;
+        }
+        return i;
+    }
+    return text.len;
+}
+
+fn dollarQuoteTagLen(comptime text: []const u8, start: usize) ?usize {
+    if (text[start] != '$') return null;
+    var i = start + 1;
+    while (i < text.len and text[i] != '$') : (i += 1) {
+        if (!(std.ascii.isAlphanumeric(text[i]) or text[i] == '_')) return null;
+    }
+    if (i >= text.len or text[i] != '$') return null;
+    return i - start + 1;
+}
+
+fn skipDollarQuoted(comptime text: []const u8, start: usize, tag_len: usize) usize {
+    const tag = text[start .. start + tag_len];
+    var i = start + tag_len;
+    while (i + tag_len <= text.len) : (i += 1) {
+        if (std.mem.eql(u8, text[i .. i + tag_len], tag)) {
+            return i + tag_len - 1;
+        }
+    }
+    return text.len;
+}
+
+fn encodeCompiledParams(allocator: std.mem.Allocator, args: anytype) ![]proto.Param {
+    const Args = @TypeOf(args);
+    const fields = std.meta.fields(Args);
+    const params = try allocator.alloc(proto.Param, fields.len);
+    inline for (fields, 0..) |field, i| {
+        params[i] = try compiledArgToParam(allocator, @field(args, field.name));
+    }
+    return params;
+}
+
+fn compiledArgToParam(allocator: std.mem.Allocator, arg: anytype) !proto.Param {
+    const T = @TypeOf(arg);
+    if (T == Value) return switch (arg) {
+        .null => .{ .value = null },
+        .typed_null => |oid| .{ .type_oid = oid, .value = null },
+        .bool => |v| .{ .type_oid = 16, .value = if (v) "t" else "f" },
+        .int2 => |v| .{ .type_oid = 21, .value = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+        .int4 => |v| .{ .type_oid = 23, .value = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+        .int8 => |v| .{ .type_oid = 20, .value = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+        .uint2 => |v| .{ .type_oid = 21, .value = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+        .uint4 => |v| .{ .type_oid = 23, .value = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+        .uint8 => |v| .{ .type_oid = 20, .value = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+        .float4 => |v| .{ .type_oid = 700, .value = try std.fmt.allocPrint(allocator, "{}", .{v}) },
+        .float8 => |v| .{ .type_oid = 701, .value = try std.fmt.allocPrint(allocator, "{}", .{v}) },
+        .text => |v| .{ .type_oid = 25, .value = v },
+        .bytea => |v| .{ .type_oid = 17, .format = .binary, .value = v },
+        .raw_text => |v| .{ .value = v },
+        .raw_binary => |v| .{ .type_oid = v.type_oid, .format = .binary, .value = v.bytes },
+    };
+
+    return switch (@typeInfo(T)) {
+        .optional => if (arg) |value|
+            try compiledArgToParam(allocator, value)
+        else
+            .{ .value = null },
+        .bool => .{ .type_oid = 16, .value = if (arg) "t" else "f" },
+        .int => |info| switch (info.bits) {
+            0...16 => if (info.signedness == .signed)
+                .{ .type_oid = 21, .value = try std.fmt.allocPrint(allocator, "{d}", .{@as(i16, @intCast(arg))}) }
+            else
+                .{ .type_oid = 21, .value = try std.fmt.allocPrint(allocator, "{d}", .{@as(u16, @intCast(arg))}) },
+            17...32 => if (info.signedness == .signed)
+                .{ .type_oid = 23, .value = try std.fmt.allocPrint(allocator, "{d}", .{@as(i32, @intCast(arg))}) }
+            else
+                .{ .type_oid = 23, .value = try std.fmt.allocPrint(allocator, "{d}", .{@as(u32, @intCast(arg))}) },
+            33...64 => if (info.signedness == .signed)
+                .{ .type_oid = 20, .value = try std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @intCast(arg))}) }
+            else
+                .{ .type_oid = 20, .value = try std.fmt.allocPrint(allocator, "{d}", .{@as(u64, @intCast(arg))}) },
+            else => @compileError("compiled query integer arguments must fit within 64 bits"),
+        },
+        .float => |info| switch (info.bits) {
+            32 => .{ .type_oid = 700, .value = try std.fmt.allocPrint(allocator, "{}", .{arg}) },
+            64 => .{ .type_oid = 701, .value = try std.fmt.allocPrint(allocator, "{}", .{arg}) },
+            else => @compileError("compiled query float arguments must be f32 or f64"),
+        },
+        .pointer => |info| switch (info.size) {
+            .slice => if (info.child == u8) .{ .type_oid = 25, .value = arg } else @compileError("compiled query slice arguments must be []const u8, []u8, or zpg.Value"),
+            else => @compileError("compiled query pointer arguments must be slices"),
+        },
+        .array => |info| if (info.child == u8) .{ .type_oid = 25, .value = arg[0..] } else @compileError("compiled query array arguments must be [N]u8"),
+        else => @compileError("unsupported compiled query argument type; use scalars, byte/text slices, optionals, or zpg.Value"),
+    };
+}
+
+fn materializeCompiledResult(comptime RowT: type, raw: Result) !CompiledResult(RowT) {
+    var owned_raw = raw;
+    const fields = std.meta.fields(RowT);
+    if (owned_raw.columns.len != 0 and owned_raw.columns.len != fields.len) return error.UnexpectedColumnCount;
+    if (owned_raw.columns.len == 0 and owned_raw.rows.len != 0 and owned_raw.rows[0].values.len != fields.len) {
+        return error.UnexpectedColumnCount;
+    }
+
+    const arena = owned_raw.arena.allocator();
+    const typed_rows = try arena.alloc(RowT, owned_raw.rows.len);
+    for (typed_rows, 0..) |*typed_row, row_index| {
+        var out: RowT = undefined;
+        inline for (fields, 0..) |field, column_index| {
+            @field(out, field.name) = try decodeCompiledField(owned_raw, row_index, column_index, field.type);
+        }
+        typed_row.* = out;
+    }
+
+    return .{
+        .raw = owned_raw,
+        .rows = typed_rows,
+    };
+}
+
+fn decodeCompiledField(result: Result, row_index: usize, column_index: usize, comptime T: type) !T {
+    if (result.columns.len == 0) {
+        return decodeCompiledFieldWithoutColumns(result.rows[row_index], column_index, T);
+    }
+    return switch (@typeInfo(T)) {
+        .optional => |opt| if (try result.decode(row_index, column_index, opt.child)) |value|
+            value
+        else
+            null,
+        else => (try result.decode(row_index, column_index, T)).? ,
+    };
+}
+
+fn decodeCompiledFieldWithoutColumns(row: Row, column_index: usize, comptime T: type) !T {
+    if (column_index >= row.values.len) return error.ColumnOutOfBounds;
+    return switch (@typeInfo(T)) {
+        .optional => |opt| if (row.values[column_index]) |raw|
+            try decodeTextValue(opt.child, raw)
+        else
+            null,
+        else => if (row.values[column_index]) |raw|
+            try decodeTextValue(T, raw)
+        else
+            error.BadValue,
+    };
 }
 
 fn collectParamTypes(allocator: std.mem.Allocator, params: []const proto.Param) ![]u32 {

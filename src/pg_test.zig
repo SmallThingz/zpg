@@ -113,6 +113,44 @@ test "pool query against local postgres" {
     var e2 = try extended_pipeline.readQuery(std.testing.allocator);
     defer e2.deinit();
     try std.testing.expectEqualStrings("pipe", e2.rows[0].get(0).?);
+
+    const StaticConnQuery = zpg.CompiledQuery(
+        "select 'compiled' as status, 11::int4 as n",
+        struct {},
+        struct {
+            status: []const u8,
+            n: i32,
+        },
+    );
+    var static_conn = try StaticConnQuery.query(conn, std.testing.allocator, .{});
+    defer static_conn.deinit();
+    try std.testing.expectEqualStrings("compiled", static_conn.rows[0].status);
+    try std.testing.expectEqual(@as(i32, 11), static_conn.rows[0].n);
+
+    var direct_param = try conn.queryValues(std.testing.allocator, "select $1::text as status, $2::int4 as n", &.{
+        .{ .text = "direct" },
+        .{ .int4 = 17 },
+    }, .{});
+    defer direct_param.deinit();
+    try std.testing.expectEqualStrings("direct", direct_param.rows[0].get(0).?);
+    try std.testing.expectEqualStrings("17", direct_param.rows[0].get(1).?);
+
+    const StaticParamQuery = zpg.CompiledQuery(
+        "select $1::text as status, $2::int4 as n",
+        struct { []const u8, i32 },
+        struct {
+            status: []const u8,
+            n: i32,
+        },
+    );
+    var static_param = try StaticParamQuery.query(conn, std.testing.allocator, .{ "typed", 19 });
+    defer static_param.deinit();
+    try std.testing.expectEqualStrings("typed", static_param.rows[0].status);
+    try std.testing.expectEqual(@as(i32, 19), static_param.rows[0].n);
+
+    const static_tag = try StaticParamQuery.exec(conn, std.testing.allocator, .{ "exec", 23 });
+    defer std.testing.allocator.free(static_tag);
+    try std.testing.expectEqualStrings("SELECT 1", static_tag);
 }
 
 test "tls query against docker postgres" {
