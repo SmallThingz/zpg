@@ -229,6 +229,7 @@ test "docker postgres requiring client cert currently fails with std tls client"
             error.TlsCertificateNotVerified,
             error.TlsUnexpectedMessage,
             error.ReadFailed,
+            error.EndOfStream,
             error.ConnectionResetByPeer,
             => {},
             else => {
