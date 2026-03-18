@@ -1799,6 +1799,239 @@ test "encode values covers text and binary params" {
     try std.testing.expect(params[3].value == null);
 }
 
+test "sql placeholder count ignores quoted and dollar quoted text" {
+    try std.testing.expectEqual(@as(usize, 2), comptime sqlPlaceholderCount(
+        "select '$1', $$ $2 $$, col from t where a = $1 and b = $2",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), comptime sqlPlaceholderCount(
+        "select \"$2\", $tag$ $9 $tag$, $1",
+    ));
+    try std.testing.expectEqual(@as(usize, 0), comptime sqlPlaceholderCount(
+        "select '$1''$2', \"x$3\", $$ $4 $$",
+    ));
+}
+
+test "compiled query infers protocol from placeholder usage" {
+    const SimpleQuery = CompiledQuery("select 1", struct {}, struct { n: i32 });
+    const ExtendedQuery = CompiledQuery("select $1::int4", struct { i32 }, struct { n: i32 });
+
+    try std.testing.expectEqual(QueryProtocol.simple, SimpleQuery.protocol);
+    try std.testing.expectEqual(QueryProtocol.extended, ExtendedQuery.protocol);
+}
+
+test "compiled arg encoder covers scalars optionals arrays and raw binary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const params = try encodeCompiledParams(arena.allocator(), .{
+        true,
+        @as(i32, -7),
+        @as(u64, 9),
+        @as(f32, 1.5),
+        @as([]const u8, "abc"),
+        @as(?i32, null),
+        @as(Value, .{ .raw_binary = .{ .type_oid = 17, .bytes = &.{ 1, 2, 3 } } }),
+    });
+
+    try std.testing.expectEqual(@as(usize, 7), params.len);
+    try std.testing.expectEqual(@as(u32, 16), params[0].type_oid);
+    try std.testing.expectEqualStrings("-7", params[1].value.?);
+    try std.testing.expectEqual(@as(u32, 20), params[2].type_oid);
+    try std.testing.expectEqual(@as(u32, 700), params[3].type_oid);
+    try std.testing.expectEqualStrings("abc", params[4].value.?);
+    try std.testing.expect(params[5].value == null);
+    try std.testing.expectEqual(proto.FormatCode.binary, params[6].format);
+    try std.testing.expectEqual(@as(u32, 17), params[6].type_oid);
+}
+
+test "collect param types preserves order and empty input" {
+    const empty = try collectParamTypes(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const values = try collectParamTypes(std.testing.allocator, &.{
+        .{ .type_oid = 23, .value = "1" },
+        .{ .type_oid = 25, .value = "x" },
+        .{ .type_oid = 17, .format = .binary, .value = &.{ 0xaa } },
+    });
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(u32, &.{ 23, 25, 17 }, values);
+}
+
+test "materialize compiled result decodes optional and positional rows" {
+    const RowT = struct {
+        a: []const u8,
+        b: ?i32,
+    };
+
+    var with_columns = Result{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    const arena1 = with_columns.arena.allocator();
+    with_columns.columns = try arena1.dupe(Column, &.{
+        .{ .name = "a", .type_oid = 25, .format = .text },
+        .{ .name = "b", .type_oid = 23, .format = .text },
+    });
+    with_columns.rows = try arena1.dupe(Row, &.{
+        .{ .values = try arena1.dupe(?[]const u8, &.{ "ok", null }) },
+    });
+    var typed1 = try materializeCompiledResult(RowT, with_columns);
+    defer typed1.deinit();
+    try std.testing.expectEqualStrings("ok", typed1.rows[0].a);
+    try std.testing.expectEqual(@as(?i32, null), typed1.rows[0].b);
+
+    var no_columns = Result{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    const arena2 = no_columns.arena.allocator();
+    no_columns.rows = try arena2.dupe(Row, &.{
+        .{ .values = try arena2.dupe(?[]const u8, &.{ "hello", "42" }) },
+    });
+    var typed2 = try materializeCompiledResult(RowT, no_columns);
+    defer typed2.deinit();
+    try std.testing.expectEqualStrings("hello", typed2.rows[0].a);
+    try std.testing.expectEqual(@as(?i32, 42), typed2.rows[0].b);
+}
+
+test "materialize compiled result rejects mismatched shape" {
+    const RowT = struct { a: []const u8, b: i32 };
+
+    var wrong_columns = Result{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer wrong_columns.deinit();
+    const arena1 = wrong_columns.arena.allocator();
+    wrong_columns.columns = try arena1.dupe(Column, &.{
+        .{ .name = "a", .type_oid = 25, .format = .text },
+    });
+    try std.testing.expectError(error.UnexpectedColumnCount, materializeCompiledResult(RowT, wrong_columns));
+
+    var wrong_row = Result{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer wrong_row.deinit();
+    const arena2 = wrong_row.arena.allocator();
+    wrong_row.rows = try arena2.dupe(Row, &.{
+        .{ .values = try arena2.dupe(?[]const u8, &.{ "only-one" }) },
+    });
+    try std.testing.expectError(error.UnexpectedColumnCount, materializeCompiledResult(RowT, wrong_row));
+}
+
+test "decode compiled field without columns validates bounds and nullability" {
+    const row = Row{ .values = &.{ "7", null } };
+    try std.testing.expectEqual(@as(i32, 7), try decodeCompiledFieldWithoutColumns(row, 0, i32));
+    try std.testing.expectEqual(@as(?i32, null), try decodeCompiledFieldWithoutColumns(row, 1, ?i32));
+    try std.testing.expectError(error.BadValue, decodeCompiledFieldWithoutColumns(row, 1, i32));
+    try std.testing.expectError(error.ColumnOutOfBounds, decodeCompiledFieldWithoutColumns(row, 2, i32));
+}
+
+test "parse format code and command complete validate inputs" {
+    try std.testing.expectEqual(proto.FormatCode.text, try parseFormatCode(0));
+    try std.testing.expectEqual(proto.FormatCode.binary, try parseFormatCode(1));
+    try std.testing.expectError(error.UnsupportedColumnFormat, parseFormatCode(9));
+
+    try std.testing.expectEqualStrings("SELECT 1", try parseCommandComplete("SELECT 1\x00"));
+    try std.testing.expectError(error.InvalidField, parseCommandComplete("missing-zero"));
+}
+
+test "read int at validates bounds" {
+    var index: usize = 0;
+    try std.testing.expectEqual(@as(u16, 0x1234), try readIntAt(u16, &.{ 0x12, 0x34 }, &index));
+    try std.testing.expectError(error.InvalidMessage, readIntAt(u32, &.{ 0x12, 0x34 }, &index));
+}
+
+test "binary and text decode reject invalid shapes" {
+    try std.testing.expectError(error.TypeMismatch, decodeBinaryValue(i32, 16, &.{1}));
+    try std.testing.expectError(error.InvalidBinaryValue, decodeBinaryValue([16]u8, 2950, &.{ 1, 2, 3 }));
+    try std.testing.expectError(error.BadValue, decodeTextValue(bool, "not-bool"));
+    try std.testing.expectError(error.UnsupportedDecode, decodeTextValue([]u8, "x"));
+}
+
+test "finish ready updates transaction state and validates payload size" {
+    var conn: Conn = undefined;
+    conn.tx_status = 'I';
+    conn.healthy = true;
+
+    try conn.finishReady(&.{ 'I' });
+    try std.testing.expectEqual(@as(u8, 'I'), conn.tx_status);
+    try std.testing.expect(conn.healthy);
+
+    conn.healthy = true;
+    try conn.finishReady(&.{ 'T' });
+    try std.testing.expectEqual(@as(u8, 'T'), conn.tx_status);
+    try std.testing.expect(!conn.healthy);
+
+    conn.healthy = true;
+    try std.testing.expectError(error.ProtocolViolation, conn.finishReady(&.{ 'I', 'x' }));
+    try std.testing.expect(!conn.healthy);
+}
+
+test "queue pipeline simple query appends statements and clears stale cache" {
+    var conn: Conn = undefined;
+    conn.allocator = std.testing.allocator;
+    conn.queued_simple_pipeline_sql = .empty;
+    conn.last_error = null;
+    conn.simple_pipeline_statement_sql = try std.testing.allocator.dupe(u8, "stale");
+    defer {
+        conn.clearSimplePipelineStatementCache();
+        conn.queued_simple_pipeline_sql.deinit(std.testing.allocator);
+    }
+
+    try conn.queuePipelineSimpleQuery("select 1");
+    try std.testing.expectEqualStrings("select 1;", conn.queued_simple_pipeline_sql.items);
+    try std.testing.expectEqual(@as(usize, 0), conn.simple_pipeline_statement_sql.len);
+
+    try conn.queuePipelineSimpleQuery("select 2");
+    try std.testing.expectEqualStrings("select 1;select 2;", conn.queued_simple_pipeline_sql.items);
+}
+
+test "parse data row rejects negative non null length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidDataRow, parseDataRow(arena.allocator(), &.{
+        0, 1,
+        0xff, 0xff, 0xff, 0xfe,
+    }));
+}
+
+test "parse row description rejects unsupported format code" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var columns: std.ArrayList(Column) = .empty;
+    defer columns.deinit(arena.allocator());
+
+    try std.testing.expectError(error.UnsupportedColumnFormat, parseRowDescription(arena.allocator(), &columns, &.{
+        0, 1,
+        'x', 0,
+        0, 0, 0, 0,
+        0, 0,
+        0, 0, 0, 23,
+        0, 4,
+        0, 0, 0, 0xff,
+        0, 2,
+    }));
+}
+
+test "message length helpers match encoded wire sizes" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    const params = [_]proto.Param{
+        .{ .type_oid = 23, .value = "7" },
+        .{ .type_oid = 25, .value = "hi" },
+    };
+
+    try proto.appendBind(&out, std.testing.allocator, "portal", "stmt", &params, .text);
+    try std.testing.expectEqual(bindMessageLen("portal", "stmt", &params), out.items.len);
+
+    out.clearRetainingCapacity();
+    try proto.appendExecute(&out, std.testing.allocator, "portal", 0);
+    try std.testing.expectEqual(executeMessageLen("portal"), out.items.len);
+
+    out.clearRetainingCapacity();
+    try proto.appendSync(&out, std.testing.allocator);
+    try std.testing.expectEqual(syncMessageLen(), out.items.len);
+
+    out.clearRetainingCapacity();
+    try proto.appendParse(&out, std.testing.allocator, "stmt", "select $1, $2", &.{ 23, 25 });
+    try proto.appendBind(&out, std.testing.allocator, "", "stmt", &params, .text);
+    try proto.appendExecute(&out, std.testing.allocator, "", 0);
+    try proto.appendSync(&out, std.testing.allocator);
+    try std.testing.expectEqual(extendedQueryMessageLen("stmt", "select $1, $2", &params, true), out.items.len);
+}
+
 test "result column index lookup" {
     var result = Result{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
     defer result.deinit();

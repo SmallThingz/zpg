@@ -376,6 +376,68 @@ test "append bind encodes null and binary parameters" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "stmt") != null);
 }
 
+test "append parse encodes statement and parameter types" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendParse(&out, std.testing.allocator, "s", "select $1", &.{ 23, 25 });
+
+    try std.testing.expectEqual(@as(u8, 'P'), out.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "select $1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "s") != null);
+}
+
+test "append startup query sync and close encode expected tags" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendStartup(&out, std.testing.allocator, "u", "d", "app");
+    try std.testing.expectEqual(@as(u8, 0), out.items[0]);
+
+    out.clearRetainingCapacity();
+    try appendQuery(&out, std.testing.allocator, "select 1");
+    try std.testing.expectEqual(@as(u8, 'Q'), out.items[0]);
+    try std.testing.expectEqual(@as(u8, 0), out.items[out.items.len - 1]);
+
+    out.clearRetainingCapacity();
+    try appendSync(&out, std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 'S'), out.items[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 0, 0, 0, 4 }, out.items);
+
+    out.clearRetainingCapacity();
+    try appendClose(&out, std.testing.allocator, .portal, "p1");
+    try std.testing.expectEqual(@as(u8, 'C'), out.items[0]);
+    try std.testing.expectEqual(@as(u8, 'P'), out.items[5]);
+}
+
+test "field c string rejects missing terminator and advances index" {
+    var index: usize = 0;
+    try std.testing.expectEqualStrings("abc", try fieldCString("abc\x00rest", &index));
+    try std.testing.expectEqual(@as(usize, 4), index);
+
+    index = 0;
+    try std.testing.expectError(error.InvalidField, fieldCString("unterminated", &index));
+}
+
+test "read message into reuses and grows buffer" {
+    var bytes = [_]u8{ 'Z', 0, 0, 0, 5, 'I' };
+    var reader = std.Io.Reader.fixed(&bytes);
+    var buffer: []u8 = &.{};
+    defer if (buffer.len != 0) std.testing.allocator.free(buffer);
+
+    const msg = try readMessageInto(std.testing.allocator, &reader, 16, &buffer);
+    try std.testing.expectEqual(@as(u8, 'Z'), msg.tag);
+    try std.testing.expectEqual(@as(usize, 1), msg.payload.len);
+    try std.testing.expectEqual(@as(u8, 'I'), msg.payload[0]);
+    try std.testing.expect(buffer.len >= 1);
+}
+
+test "decode authentication rejects truncated and unsupported payloads" {
+    try std.testing.expectError(error.InvalidAuthentication, decodeAuthentication(&.{ 0, 0, 0 }));
+    try std.testing.expectError(error.UnsupportedAuthentication, decodeAuthentication(&.{ 0, 0, 0, 99 }));
+    try std.testing.expectError(error.InvalidAuthentication, decodeAuthentication(&.{ 0, 0, 0, 5, 1, 2, 3 }));
+}
+
 test "protocol fuzz parsers stay bounded" {
     var prng = std.Random.DefaultPrng.init(0x1234abcd);
     const random = prng.random();

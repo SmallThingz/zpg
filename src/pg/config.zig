@@ -141,3 +141,29 @@ test "parse postgres uri accepts ssl modes" {
 test "parse postgres uri rejects invalid ssl mode" {
     try std.testing.expectError(error.InvalidSslMode, Config.parseUri(std.testing.allocator, "postgres://alice@localhost/db?sslmode=allow"));
 }
+
+test "parse postgres uri applies defaults and ignores bad numeric overrides" {
+    var cfg = try Config.parseUri(std.testing.allocator, "postgres://alice@localhost/db?connect_timeout=bad&max_message_len=nope");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 5432), cfg.port);
+    try std.testing.expectEqualStrings("zpg", cfg.application_name);
+    try std.testing.expectEqual(@as(u32, 5_000), cfg.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 16 * 1024 * 1024), cfg.max_message_len);
+}
+
+test "parse postgres uri rejects bad scheme and missing user" {
+    try std.testing.expectError(error.InvalidScheme, Config.parseUri(std.testing.allocator, "mysql://alice@localhost/db"));
+    try std.testing.expectError(error.MissingUser, Config.parseUri(std.testing.allocator, "postgres://localhost/db"));
+}
+
+test "parse postgres uri decodes hostless unix style fields and blank query pairs" {
+    var cfg = try Config.parseUri(std.testing.allocator, "postgresql://bob:pw@localhost/mydb?&application_name=x&&sslrootcert=%2Fca.pem");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("bob", cfg.user);
+    try std.testing.expectEqualStrings("pw", cfg.password.?);
+    try std.testing.expectEqualStrings("mydb", cfg.database);
+    try std.testing.expectEqualStrings("x", cfg.application_name);
+    try std.testing.expectEqualStrings("/ca.pem", cfg.ssl_root_cert.?);
+}
