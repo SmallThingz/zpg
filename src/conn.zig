@@ -335,6 +335,7 @@ pub const Conn = struct {
     stream: std.Io.net.Stream,
     reader: std.Io.net.Stream.Reader,
     writer: std.Io.net.Stream.Writer,
+    reader_override: ?std.Io.Reader = null,
     read_buffer: []u8,
     write_buffer: []u8,
     queued_writes: std.ArrayList(u8) = .empty,
@@ -1155,6 +1156,7 @@ pub const Conn = struct {
     }
 
     fn currentReader(conn: *Conn) *std.Io.Reader {
+        if (conn.reader_override) |*reader| return reader;
         if (conn.tls) |tls| return &tls.client.reader;
         return &conn.reader.interface;
     }
@@ -2032,6 +2034,84 @@ test "message length helpers match encoded wire sizes" {
     try std.testing.expectEqual(extendedQueryMessageLen("stmt", "select $1, $2", &params, true), out.items.len);
 }
 
+test "read query result mode rejects extended sequence without control message" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendTestMessage(&bytes, 'T', &.{
+        0, 1,
+        'n', 0,
+        0, 0, 0, 0,
+        0, 0,
+        0, 0, 0, 23,
+        0, 4,
+        0, 0, 0, 0xff,
+        0, 0,
+    });
+    try appendTestMessage(&bytes, 'D', &.{
+        0, 1,
+        0, 0, 0, 1,
+        '7',
+    });
+    try appendTestMessage(&bytes, 'C', "SELECT 1\x00");
+    try appendTestMessage(&bytes, 'Z', &.{ 'I' });
+
+    var conn = testConnWithFixedReader(bytes.items);
+    defer if (conn.message_buffer.len != 0) std.testing.allocator.free(conn.message_buffer);
+    try std.testing.expectError(error.ProtocolViolation, conn.readQueryResultMode(std.testing.allocator, true, true));
+    try std.testing.expect(!conn.healthy);
+}
+
+test "read exec result mode accepts extended command without ready when control message seen" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendTestMessage(&bytes, '1', &.{});
+    try appendTestMessage(&bytes, 'C', "UPDATE 3\x00");
+
+    var conn = testConnWithFixedReader(bytes.items);
+    defer if (conn.message_buffer.len != 0) std.testing.allocator.free(conn.message_buffer);
+    const tag = try conn.readExecResultMode(std.testing.allocator, true, false);
+    defer std.testing.allocator.free(tag);
+    try std.testing.expectEqualStrings("UPDATE 3", tag);
+}
+
+test "discard pipeline extended result rejects missing control message" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendTestMessage(&bytes, 'C', "SELECT 1\x00");
+
+    var conn = testConnWithFixedReader(bytes.items);
+    defer if (conn.message_buffer.len != 0) std.testing.allocator.free(conn.message_buffer);
+    try std.testing.expectError(error.ProtocolViolation, conn.discardPipelineExtendedResult(false));
+    try std.testing.expect(!conn.healthy);
+}
+
+test "read simple query result marks protocol violation on bad ready payload" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendTestMessage(&bytes, 'T', &.{
+        0, 1,
+        'n', 0,
+        0, 0, 0, 0,
+        0, 0,
+        0, 0, 0, 23,
+        0, 4,
+        0, 0, 0, 0xff,
+        0, 0,
+    });
+    try appendTestMessage(&bytes, 'D', &.{
+        0, 1,
+        0, 0, 0, 1,
+        '7',
+    });
+    try appendTestMessage(&bytes, 'C', "SELECT 1\x00");
+    try appendTestMessage(&bytes, 'Z', &.{ 'I', 'x' });
+
+    var conn = testConnWithFixedReader(bytes.items);
+    defer if (conn.message_buffer.len != 0) std.testing.allocator.free(conn.message_buffer);
+    try std.testing.expectError(error.ProtocolViolation, conn.readQueryResultMode(std.testing.allocator, false, true));
+    try std.testing.expect(!conn.healthy);
+}
+
 test "result column index lookup" {
     var result = Result{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
     defer result.deinit();
@@ -2073,3 +2153,40 @@ test "row description parser fuzz stays bounded" {
         _ = parseRowDescription(arena.allocator(), &columns, payload) catch {};
     }
 }
+
+fn appendTestMessage(out: *std.ArrayList(u8), tag: u8, payload: []const u8) !void {
+    try out.append(std.testing.allocator, tag);
+    var len_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, @as(u32, @intCast(payload.len + 4)), .big);
+    try out.appendSlice(std.testing.allocator, &len_bytes);
+    try out.appendSlice(std.testing.allocator, payload);
+}
+
+fn testConnWithFixedReader(bytes: []const u8) Conn {
+    return .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .config = &test_config,
+        .stream = undefined,
+        .reader = undefined,
+        .writer = undefined,
+        .reader_override = std.Io.Reader.fixed(bytes),
+        .read_buffer = &.{},
+        .write_buffer = &.{},
+        .healthy = true,
+        .tx_status = 'I',
+    };
+}
+
+const test_config: Config = .{
+    .host = @constCast("localhost"),
+    .port = 5432,
+    .user = @constCast("postgres"),
+    .password = null,
+    .database = @constCast("postgres"),
+    .application_name = @constCast("zpg-test"),
+    .ssl_mode = .disable,
+    .ssl_root_cert = null,
+    .connect_timeout_ms = 0,
+    .max_message_len = 1024 * 1024,
+};
