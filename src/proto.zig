@@ -1,15 +1,5 @@
 const std = @import("std");
 
-pub const Message = struct {
-    tag: u8,
-    payload: []u8,
-
-    pub fn deinit(msg: *Message, allocator: std.mem.Allocator) void {
-        allocator.free(msg.payload);
-        msg.* = undefined;
-    }
-};
-
 pub const MessageView = struct {
     tag: u8,
     payload: []u8,
@@ -18,11 +8,6 @@ pub const MessageView = struct {
 pub const FormatCode = enum(u16) {
     text = 0,
     binary = 1,
-};
-
-pub const DescribeTarget = enum(u8) {
-    statement = 'S',
-    portal = 'P',
 };
 
 pub const CloseTarget = enum(u8) {
@@ -49,16 +34,6 @@ pub const ErrorResponse = struct {
     }
 };
 
-pub fn readMessage(allocator: std.mem.Allocator, reader: *std.Io.Reader, max_message_len: u32) !Message {
-    const tag = try reader.takeByte();
-    const len = try reader.takeInt(u32, .big);
-    if (len < 4 or len - 4 > max_message_len) return error.InvalidMessageLength;
-    const payload = try allocator.alloc(u8, len - 4);
-    errdefer allocator.free(payload);
-    try reader.readSliceAll(payload);
-    return .{ .tag = tag, .payload = payload };
-}
-
 pub fn readMessageInto(allocator: std.mem.Allocator, reader: *std.Io.Reader, max_message_len: u32, buffer: *[]u8) !MessageView {
     const tag = try reader.takeByte();
     const len = try reader.takeInt(u32, .big);
@@ -72,57 +47,9 @@ pub fn readMessageInto(allocator: std.mem.Allocator, reader: *std.Io.Reader, max
     return .{ .tag = tag, .payload = buffer.*[0..payload_len] };
 }
 
-pub fn writeStartup(writer: *std.Io.Writer, user: []const u8, database: []const u8, application_name: []const u8) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.page_allocator);
-    try appendStartup(&buf, std.heap.page_allocator, user, database, application_name);
-    try writer.writeAll(buf.items);
-    try writer.flush();
-}
-
 pub fn appendSslRequest(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     try appendInt(out, allocator, u32, 8);
     try appendInt(out, allocator, u32, 80877103);
-}
-
-pub fn writeQuery(writer: *std.Io.Writer, sql: []const u8) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.page_allocator);
-    try appendQuery(&buf, std.heap.page_allocator, sql);
-    try writer.writeAll(buf.items);
-    try writer.flush();
-}
-
-pub fn writePassword(writer: *std.Io.Writer, password: []const u8) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.page_allocator);
-    try appendPasswordMessage(&buf, std.heap.page_allocator, password);
-    try writer.writeAll(buf.items);
-    try writer.flush();
-}
-
-pub fn writeSaslInitialResponse(writer: *std.Io.Writer, mechanism: []const u8, response: []const u8) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.page_allocator);
-    try appendSaslInitialResponse(&buf, std.heap.page_allocator, mechanism, response);
-    try writer.writeAll(buf.items);
-    try writer.flush();
-}
-
-pub fn writeSaslResponse(writer: *std.Io.Writer, response: []const u8) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.page_allocator);
-    try appendSaslResponse(&buf, std.heap.page_allocator, response);
-    try writer.writeAll(buf.items);
-    try writer.flush();
-}
-
-pub fn writeTerminate(writer: *std.Io.Writer) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.page_allocator);
-    try appendTerminate(&buf, std.heap.page_allocator);
-    try writer.writeAll(buf.items);
-    try writer.flush();
 }
 
 pub fn appendStartup(out: *std.ArrayList(u8), allocator: std.mem.Allocator, user: []const u8, database: []const u8, application_name: []const u8) !void {
@@ -202,12 +129,6 @@ pub fn appendBind(out: *std.ArrayList(u8), allocator: std.mem.Allocator, portal_
     }
     try appendInt(out, allocator, u16, 1);
     try appendInt(out, allocator, u16, @intFromEnum(result_format));
-}
-
-pub fn appendDescribe(out: *std.ArrayList(u8), allocator: std.mem.Allocator, target: DescribeTarget, name: []const u8) !void {
-    try appendTaggedHeader(out, allocator, 'D', 1 + name.len + 1);
-    try out.append(allocator, @intFromEnum(target));
-    try appendCString(out, allocator, name);
 }
 
 pub fn appendExecute(out: *std.ArrayList(u8), allocator: std.mem.Allocator, portal_name: []const u8, max_rows: u32) !void {
@@ -349,7 +270,9 @@ test "parse error response extracts primary fields" {
 test "read message enforces maximum length" {
     var bytes = [_]u8{ 'Z', 0, 0, 0, 8, 'I', 0, 0, 0 };
     var reader = std.Io.Reader.fixed(&bytes);
-    try std.testing.expectError(error.InvalidMessageLength, readMessage(std.testing.allocator, &reader, 1));
+    var buffer: []u8 = &.{};
+    defer if (buffer.len != 0) std.testing.allocator.free(buffer);
+    try std.testing.expectError(error.InvalidMessageLength, readMessageInto(std.testing.allocator, &reader, 1, &buffer));
 }
 
 test "parse error response keeps last duplicate field without leaking" {

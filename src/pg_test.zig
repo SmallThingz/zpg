@@ -61,7 +61,7 @@ test "pool query against local postgres" {
     var pool = try zpg.Pool.initUri(std.testing.allocator, std.testing.io, url, 2);
     defer pool.deinit();
 
-    var result = try pool.queryAlloc(std.testing.allocator, "select 'ok' as status, 7::int as n");
+    var result = try pool.query(std.testing.allocator, "select 'ok' as status, 7::int as n");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
@@ -82,7 +82,7 @@ test "pool query against local postgres" {
     const conn = try zpg.Conn.connect(std.testing.allocator, std.testing.io, &cfg);
     defer conn.destroy();
 
-    var conn_result = try conn.queryAlloc(std.testing.allocator, "select 'conn' as status");
+    var conn_result = try conn.query(std.testing.allocator, "select 'conn' as status");
     defer conn_result.deinit();
     try std.testing.expectEqualStrings("conn", conn_result.rows[0].get(0).?);
 
@@ -113,6 +113,36 @@ test "pool query against local postgres" {
     var e2 = try extended_pipeline.readQuery(std.testing.allocator);
     defer e2.deinit();
     try std.testing.expectEqualStrings("pipe", e2.rows[0].get(0).?);
+
+    var parameter_pipeline = conn.pipeline(.{
+        .protocol = .extended,
+    });
+    var prepared_for_pipeline = try conn.prepare(std.testing.allocator, "select $1::text as prepared_label");
+    defer prepared_for_pipeline.deinit();
+    try parameter_pipeline.queryValues(std.testing.allocator, "select $1::text as label, $2::int4 as n", &.{
+        .{ .text = "param-pipe" },
+        .{ .int4 = 29 },
+    });
+    try parameter_pipeline.execValues(std.testing.allocator, "select $1::int4", &.{
+        .{ .int4 = 31 },
+    });
+    try parameter_pipeline.preparedQueryValues(std.testing.allocator, prepared_for_pipeline.name, &.{
+        .{ .text = "prepared-pipe" },
+    });
+    try parameter_pipeline.flush();
+
+    var pv1 = try parameter_pipeline.readQuery(std.testing.allocator);
+    defer pv1.deinit();
+    try std.testing.expectEqualStrings("param-pipe", pv1.rows[0].get(0).?);
+    try std.testing.expectEqualStrings("29", pv1.rows[0].get(1).?);
+
+    const pv_tag = try parameter_pipeline.readExec(std.testing.allocator);
+    defer std.testing.allocator.free(pv_tag);
+    try std.testing.expectEqualStrings("SELECT 1", pv_tag);
+
+    var pv2 = try parameter_pipeline.readQuery(std.testing.allocator);
+    defer pv2.deinit();
+    try std.testing.expectEqualStrings("prepared-pipe", pv2.rows[0].get(0).?);
 
     const StaticConnQuery = zpg.CompiledQuery(
         "select 'compiled' as status, 11::int4 as n",
@@ -151,6 +181,23 @@ test "pool query against local postgres" {
     const static_tag = try StaticParamQuery.exec(conn, std.testing.allocator, .{ "exec", 23 });
     defer std.testing.allocator.free(static_tag);
     try std.testing.expectEqualStrings("SELECT 1", static_tag);
+
+    var compiled_pipeline = conn.pipeline(.{
+        .protocol = .extended,
+    });
+    try StaticParamQuery.queue(&compiled_pipeline, std.testing.allocator, .{ "compiled-pipe-1", 37 });
+    try StaticParamQuery.queue(&compiled_pipeline, std.testing.allocator, .{ "compiled-pipe-2", 41 });
+    try compiled_pipeline.flush();
+
+    var cp1 = try StaticParamQuery.read(&compiled_pipeline, std.testing.allocator);
+    defer cp1.deinit();
+    try std.testing.expectEqualStrings("compiled-pipe-1", cp1.rows[0].status);
+    try std.testing.expectEqual(@as(i32, 37), cp1.rows[0].n);
+
+    var cp2 = try StaticParamQuery.read(&compiled_pipeline, std.testing.allocator);
+    defer cp2.deinit();
+    try std.testing.expectEqualStrings("compiled-pipe-2", cp2.rows[0].status);
+    try std.testing.expectEqual(@as(i32, 41), cp2.rows[0].n);
 }
 
 test "tls query against docker postgres" {
@@ -166,6 +213,7 @@ test "tls query against docker postgres" {
 
     var pool = zpg.Pool.initUri(std.testing.allocator, std.testing.io, url, 2) catch |err| {
         if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
+        try reportDockerTlsFailure("pool init failed", err, pg.container_name);
         return err;
     };
     defer pool.deinit();
@@ -177,6 +225,7 @@ test "tls query against docker postgres" {
         .result_format = .binary,
     }) catch |err| {
         if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
+        try reportDockerTlsFailure("query failed", err, pg.container_name);
         return err;
     };
     defer result.deinit();
@@ -188,6 +237,7 @@ test "tls query against docker postgres" {
     defer cfg.deinit(std.testing.allocator);
     const conn = zpg.Conn.connect(std.testing.allocator, std.testing.io, &cfg) catch |err| {
         if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
+        try reportDockerTlsFailure("connect failed", err, pg.container_name);
         return err;
     };
     defer conn.destroy();
@@ -317,6 +367,12 @@ fn dockerLogsAlloc(container_name: []const u8) ![]u8 {
     });
     defer std.testing.allocator.free(result.stderr);
     return result.stdout;
+}
+
+fn reportDockerTlsFailure(context: []const u8, err: anyerror, container_name: []const u8) !void {
+    const logs = try dockerLogsAlloc(container_name);
+    defer std.testing.allocator.free(logs);
+    std.debug.print("{s}: {s}\ndocker logs:\n{s}\n", .{ context, @errorName(err), logs });
 }
 
 fn isKnownStdTlsInteropError(err: anyerror) bool {

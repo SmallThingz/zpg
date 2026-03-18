@@ -100,14 +100,10 @@ pub const Pool = struct {
         pool.mutex.unlock(pool.io);
     }
 
-    pub fn queryAlloc(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8) !Result {
+    pub fn query(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8) !Result {
         const conn = try pool.acquire();
         defer pool.release(conn);
-        return conn.queryAlloc(allocator, sql);
-    }
-
-    pub fn query(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8) !Result {
-        return pool.queryAlloc(allocator, sql);
+        return conn.query(allocator, sql);
     }
 
     pub fn queryOpts(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, opts: QueryOptions) !Result {

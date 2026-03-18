@@ -13,6 +13,7 @@
 //! - `conn.exec(...)` / `pool.exec(...)` run SQL and return the command tag
 //! - `conn.queryValues(...)`, `conn.execValues(...)`, and `conn.prepare(...)` expose the extended protocol
 //! - `conn.pipeline(...)` exposes pipelined simple or extended execution on one connection
+//! - `zpg.CompiledQuery(...)` fixes SQL shape, protocol selection, parameter typing, and typed row decoding at comptime
 //!
 //! ## Supported today
 //!
@@ -22,6 +23,7 @@
 //! - simple query protocol
 //! - extended protocol with prepared statements
 //! - pipelined execution on a single connection
+//! - parameterized pipelining on a single connection
 //! - fixed-size lazy connection pool
 //! - text and binary result decoding
 //!
