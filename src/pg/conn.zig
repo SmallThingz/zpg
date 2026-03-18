@@ -126,7 +126,92 @@ pub const Statement = struct {
     }
 };
 
+pub const Pipeline = struct {
+    conn: *Conn,
+    opts: QueryOptions,
+    pending: usize = 0,
+
+    pub fn init(conn: *Conn, opts: QueryOptions) Pipeline {
+        return .{
+            .conn = conn,
+            .opts = opts,
+        };
+    }
+
+    pub fn query(pipeline: *Pipeline, sql: []const u8) !void {
+        switch (pipeline.opts.protocol) {
+            .simple => {
+                if (pipeline.opts.result_format != .text) return error.UnsupportedResultFormat;
+                try pipeline.conn.queueSimpleQuery(sql);
+            },
+            .extended => try pipeline.conn.queueExtendedQuery("", sql, &.{}, pipeline.opts.result_format, true),
+        }
+        pipeline.pending += 1;
+    }
+
+    pub fn queryValues(pipeline: *Pipeline, allocator: std.mem.Allocator, sql: []const u8, values: []const Value) !void {
+        _ = allocator;
+        _ = sql;
+        _ = values;
+        _ = pipeline;
+        return error.UnsupportedPipelineParameters;
+    }
+
+    pub fn execValues(pipeline: *Pipeline, allocator: std.mem.Allocator, sql: []const u8, values: []const Value) !void {
+        try pipeline.queryValues(allocator, sql, values);
+    }
+
+    pub fn preparedQueryValues(pipeline: *Pipeline, allocator: std.mem.Allocator, statement_name: []const u8, values: []const Value) !void {
+        _ = allocator;
+        _ = statement_name;
+        _ = values;
+        if (pipeline.opts.protocol == .simple) return error.UnsupportedProtocol;
+        return error.UnsupportedPipelineParameters;
+    }
+
+    pub fn exec(pipeline: *Pipeline, sql: []const u8) !void {
+        try pipeline.query(sql);
+    }
+
+    pub fn preparedExecValues(pipeline: *Pipeline, allocator: std.mem.Allocator, statement_name: []const u8, values: []const Value) !void {
+        try pipeline.preparedQueryValues(allocator, statement_name, values);
+    }
+
+    pub fn flush(pipeline: *Pipeline) !void {
+        try pipeline.conn.flushPendingWrites();
+    }
+
+    pub fn readQuery(pipeline: *Pipeline, allocator: std.mem.Allocator) !Result {
+        if (pipeline.pending == 0) return error.NoPendingResults;
+        pipeline.pending -= 1;
+        return switch (pipeline.opts.protocol) {
+            .simple => pipeline.conn.readSimpleQueryResult(allocator),
+            .extended => pipeline.conn.readQueryResult(allocator, true),
+        };
+    }
+
+    pub fn readExec(pipeline: *Pipeline, allocator: std.mem.Allocator) ![]const u8 {
+        if (pipeline.pending == 0) return error.NoPendingResults;
+        pipeline.pending -= 1;
+        return switch (pipeline.opts.protocol) {
+            .simple => pipeline.conn.readSimpleExecResult(allocator),
+            .extended => pipeline.conn.readExecResult(allocator, true),
+        };
+    }
+
+    pub fn discard(pipeline: *Pipeline) !void {
+        if (pipeline.pending == 0) return error.NoPendingResults;
+        pipeline.pending -= 1;
+        return switch (pipeline.opts.protocol) {
+            .simple => pipeline.conn.discardSimpleQueryResult(),
+            .extended => pipeline.conn.discardExtendedResult(),
+        };
+    }
+};
+
 const TlsState = struct {
+    base_reader: std.Io.net.Stream.Reader,
+    base_writer: std.Io.net.Stream.Writer,
     client: TlsClient,
     read_buffer: []u8,
     write_buffer: []u8,
@@ -150,6 +235,7 @@ pub const Conn = struct {
     writer: std.Io.net.Stream.Writer,
     read_buffer: []u8,
     write_buffer: []u8,
+    queued_writes: std.ArrayList(u8) = .empty,
     tls: ?*TlsState = null,
     message_buffer: []u8 = &.{},
     backend_pid: i32 = 0,
@@ -158,6 +244,8 @@ pub const Conn = struct {
     healthy: bool = true,
     last_error: ?proto.ErrorResponse = null,
     next_statement_id: u64 = 0,
+    unnamed_statement_sql: []u8 = &.{},
+    unnamed_statement_param_types: []u32 = &.{},
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !*Conn {
         return create(allocator, io, config);
@@ -203,6 +291,7 @@ pub const Conn = struct {
         const allocator = conn.allocator;
         defer conn.* = undefined;
         if (conn.last_error) |*err| err.deinit(allocator);
+        conn.clearUnnamedStatementCache();
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
         proto.appendTerminate(&out, allocator) catch {};
@@ -215,6 +304,7 @@ pub const Conn = struct {
         if (conn.message_buffer.len != 0) allocator.free(conn.message_buffer);
         allocator.free(conn.read_buffer);
         allocator.free(conn.write_buffer);
+        conn.queued_writes.deinit(allocator);
     }
 
     pub fn queryAlloc(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) !Result {
@@ -223,6 +313,77 @@ pub const Conn = struct {
 
     pub fn query(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) !Result {
         return conn.queryOpts(allocator, sql, .{});
+    }
+
+    pub fn sendSimpleQuery(conn: *Conn, sql: []const u8) !void {
+        conn.clearLastError();
+        try conn.writeSimpleQueryBuffered(sql);
+        try conn.flushWrites();
+    }
+
+    pub fn pipeline(conn: *Conn, opts: QueryOptions) Pipeline {
+        return Pipeline.init(conn, opts);
+    }
+
+    pub fn queueSimpleQuery(conn: *Conn, sql: []const u8) !void {
+        conn.clearLastError();
+        try conn.writeSimpleQueryBuffered(sql);
+    }
+
+    pub fn flushPendingWrites(conn: *Conn) !void {
+        try conn.flushWrites();
+    }
+
+    pub fn readSimpleQueryResult(conn: *Conn, allocator: std.mem.Allocator) !Result {
+        return conn.readQueryResult(allocator, false);
+    }
+
+    pub fn readSimpleExecResult(conn: *Conn, allocator: std.mem.Allocator) ![]const u8 {
+        return conn.readExecResult(allocator, false);
+    }
+
+    pub fn discardSimpleQueryResult(conn: *Conn) !void {
+        var failed = false;
+        while (true) {
+            const msg = try conn.readMessage();
+            switch (msg.tag) {
+                'T', 'D', 'C', 'I', 'S', 'N', 'A' => {},
+                'E' => {
+                    failed = true;
+                    conn.setLastError(msg.payload) catch return conn.protocolError();
+                },
+                'Z' => {
+                    try conn.finishReady(msg.payload);
+                    if (failed) return error.PgServer;
+                    return;
+                },
+                else => return conn.protocolError(),
+            }
+        }
+    }
+
+    pub fn discardExtendedResult(conn: *Conn) !void {
+        var failed = false;
+        var saw_extended_control = false;
+        while (true) {
+            const msg = try conn.readMessage();
+            switch (msg.tag) {
+                '1', '2' => saw_extended_control = true,
+                'T', 'D', 'C', 'I', 'n', 'S', 'N' => {},
+                't', 'A', 's' => {},
+                'E' => {
+                    failed = true;
+                    conn.setLastError(msg.payload) catch return conn.protocolError();
+                },
+                'Z' => {
+                    try conn.finishReady(msg.payload);
+                    if (!saw_extended_control) return conn.protocolError();
+                    if (failed) return error.PgServer;
+                    return;
+                },
+                else => return conn.protocolError(),
+            }
+        }
     }
 
     pub fn queryOpts(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, opts: QueryOptions) !Result {
@@ -343,19 +504,15 @@ pub const Conn = struct {
 
     fn querySimple(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) !Result {
         conn.clearLastError();
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(conn.allocator);
-        try proto.appendQuery(&out, conn.allocator, sql);
-        try conn.writeMessages(out.items);
+        try conn.writeSimpleQueryBuffered(sql);
+        try conn.flushWrites();
         return conn.readQueryResult(allocator, false);
     }
 
     fn execSimple(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
         conn.clearLastError();
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(conn.allocator);
-        try proto.appendQuery(&out, conn.allocator, sql);
-        try conn.writeMessages(out.items);
+        try conn.writeSimpleQueryBuffered(sql);
+        try conn.flushWrites();
         return conn.readExecResult(allocator, false);
     }
 
@@ -404,28 +561,45 @@ pub const Conn = struct {
     }
 
     fn sendExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, params: []const proto.Param, result_format: proto.FormatCode, include_parse: bool) !void {
-        var out: std.ArrayList(u8) = .empty;
+        try conn.queueExtendedQuery(statement_name, sql, params, result_format, include_parse);
+        try conn.flushWrites();
+    }
+
+    fn queueExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, params: []const proto.Param, result_format: proto.FormatCode, include_parse: bool) !void {
+        var out = try std.ArrayList(u8).initCapacity(conn.allocator, extendedQueryMessageLen(statement_name, sql, params, include_parse));
         defer out.deinit(conn.allocator);
+        const cache_unnamed = statement_name.len == 0 and include_parse;
+        var param_types: []u32 = &.{};
+        var need_parse = include_parse;
         if (include_parse) {
-            const param_types = try collectParamTypes(conn.allocator, params);
+            param_types = try collectParamTypes(conn.allocator, params);
             defer conn.allocator.free(param_types);
+            if (cache_unnamed) {
+                need_parse = !conn.matchesUnnamedStatement(sql, param_types);
+            }
+        }
+        if (need_parse) {
             try proto.appendParse(&out, conn.allocator, statement_name, sql, param_types);
+            if (cache_unnamed) try conn.updateUnnamedStatementCache(sql, param_types);
         }
         try proto.appendBind(&out, conn.allocator, "", statement_name, params, result_format);
-        try proto.appendDescribe(&out, conn.allocator, .portal, "");
         try proto.appendExecute(&out, conn.allocator, "", 0);
         try proto.appendSync(&out, conn.allocator);
-        try conn.writeMessages(out.items);
+        try conn.queueMessages(out.items);
     }
 
     fn sendExtendedExecute(conn: *Conn, statement_name: []const u8, params: []const proto.Param, result_format: proto.FormatCode) !void {
-        var out: std.ArrayList(u8) = .empty;
+        try conn.queueExtendedExecute(statement_name, params, result_format);
+        try conn.flushWrites();
+    }
+
+    fn queueExtendedExecute(conn: *Conn, statement_name: []const u8, params: []const proto.Param, result_format: proto.FormatCode) !void {
+        var out = try std.ArrayList(u8).initCapacity(conn.allocator, extendedExecuteMessageLen(statement_name, params));
         defer out.deinit(conn.allocator);
         try proto.appendBind(&out, conn.allocator, "", statement_name, params, result_format);
-        try proto.appendDescribe(&out, conn.allocator, .portal, "");
         try proto.appendExecute(&out, conn.allocator, "", 0);
         try proto.appendSync(&out, conn.allocator);
-        try conn.writeMessages(out.items);
+        try conn.queueMessages(out.items);
     }
 
     fn readQueryResult(conn: *Conn, allocator: std.mem.Allocator, extended: bool) !Result {
@@ -447,7 +621,7 @@ pub const Conn = struct {
                 'T' => try parseRowDescription(arena, &columns, msg.payload),
                 'D' => try rows.append(arena, try parseDataRow(arena, msg.payload)),
                 'C' => command_tag = try arena.dupe(u8, try parseCommandComplete(msg.payload)),
-                'I', 'n' => {},
+                'I', 'n', 't', 'A', 's' => {},
                 'E' => {
                     failed = true;
                     conn.setLastError(msg.payload) catch return conn.protocolError();
@@ -476,7 +650,7 @@ pub const Conn = struct {
             switch (msg.tag) {
                 '1', '2' => saw_extended_control = true,
                 'C' => command_tag = try allocator.dupe(u8, try parseCommandComplete(msg.payload)),
-                'T', 'D', 'I', 'n', 'S', 'N' => {},
+                'T', 'D', 'I', 'n', 'S', 'N', 't', 'A', 's' => {},
                 'E' => {
                     failed = true;
                     conn.setLastError(msg.payload) catch return conn.protocolError();
@@ -590,6 +764,32 @@ pub const Conn = struct {
         }
     }
 
+    fn clearUnnamedStatementCache(conn: *Conn) void {
+        if (conn.unnamed_statement_sql.len != 0) {
+            conn.allocator.free(conn.unnamed_statement_sql);
+            conn.unnamed_statement_sql = &.{};
+        }
+        if (conn.unnamed_statement_param_types.len != 0) {
+            conn.allocator.free(conn.unnamed_statement_param_types);
+            conn.unnamed_statement_param_types = &.{};
+        }
+    }
+
+    fn matchesUnnamedStatement(conn: *const Conn, sql: []const u8, param_types: []const u32) bool {
+        return std.mem.eql(u8, conn.unnamed_statement_sql, sql) and
+            std.mem.eql(u32, conn.unnamed_statement_param_types, param_types);
+    }
+
+    fn updateUnnamedStatementCache(conn: *Conn, sql: []const u8, param_types: []const u32) !void {
+        conn.clearUnnamedStatementCache();
+        conn.unnamed_statement_sql = try conn.allocator.dupe(u8, sql);
+        errdefer {
+            conn.allocator.free(conn.unnamed_statement_sql);
+            conn.unnamed_statement_sql = &.{};
+        }
+        conn.unnamed_statement_param_types = try conn.allocator.dupe(u32, param_types);
+    }
+
     fn setLastError(conn: *Conn, payload: []const u8) !void {
         conn.clearLastError();
         conn.last_error = try proto.parseErrorResponse(conn.allocator, payload);
@@ -616,13 +816,45 @@ pub const Conn = struct {
     }
 
     fn writeMessages(conn: *Conn, bytes: []const u8) !void {
+        try conn.queueMessages(bytes);
+        try conn.flushWrites();
+    }
+
+    fn queueMessages(conn: *Conn, bytes: []const u8) !void {
+        try conn.queued_writes.appendSlice(conn.allocator, bytes);
+    }
+
+    fn writeSimpleQueryBuffered(conn: *Conn, sql: []const u8) !void {
+        var header: [5]u8 = undefined;
+        header[0] = 'Q';
+        std.mem.writeInt(u32, header[1..5], @as(u32, @intCast(sql.len + 5)), .big);
+        const zero = [_]u8{0};
+
         if (conn.tls) |tls| {
-            try tls.client.writer.writeAll(bytes);
-            try tls.client.writer.flush();
-            try conn.writer.interface.flush();
+            try tls.client.writer.writeAll(&header);
+            try tls.client.writer.writeAll(sql);
+            try tls.client.writer.writeAll(&zero);
             return;
         }
-        try conn.writer.interface.writeAll(bytes);
+
+        try conn.writer.interface.writeAll(&header);
+        try conn.writer.interface.writeAll(sql);
+        try conn.writer.interface.writeAll(&zero);
+    }
+
+    fn flushWrites(conn: *Conn) !void {
+        if (conn.queued_writes.items.len != 0) {
+            if (conn.tls) |tls| {
+                try tls.client.writer.writeAll(conn.queued_writes.items);
+            } else {
+                try conn.writer.interface.writeAll(conn.queued_writes.items);
+            }
+            conn.queued_writes.clearRetainingCapacity();
+        }
+        if (conn.tls) |tls| {
+            try tls.client.writer.flush();
+            return;
+        }
         try conn.writer.interface.flush();
     }
 
@@ -643,7 +875,13 @@ pub const Conn = struct {
             else => return err,
         };
         switch (response) {
-            'S' => try conn.enableTls(),
+            'S' => {
+                // Start TLS from a fresh stream reader/writer state after the
+                // one-byte PostgreSQL SSL negotiation response.
+                conn.reader = conn.stream.reader(conn.io, conn.read_buffer);
+                conn.writer = conn.stream.writer(conn.io, conn.write_buffer);
+                try conn.enableTls();
+            },
             'N' => switch (conn.config.ssl_mode) {
                 .prefer => {},
                 else => return error.TlsUnsupported,
@@ -654,13 +892,26 @@ pub const Conn = struct {
 
     fn enableTls(conn: *Conn) !void {
         const tls = try conn.allocator.create(TlsState);
-        errdefer conn.allocator.destroy(tls);
+        tls.* = .{
+            .base_reader = undefined,
+            .base_writer = undefined,
+            .client = undefined,
+            .read_buffer = &.{},
+            .write_buffer = &.{},
+            .ca_bundle = null,
+        };
+        var tls_initialized = false;
+        errdefer if (tls_initialized) {
+            tls.deinit(conn.allocator);
+        } else {
+            if (tls.ca_bundle) |*bundle| bundle.deinit(conn.allocator);
+            if (tls.read_buffer.len != 0) conn.allocator.free(tls.read_buffer);
+            if (tls.write_buffer.len != 0) conn.allocator.free(tls.write_buffer);
+            conn.allocator.destroy(tls);
+        };
 
         tls.read_buffer = try conn.allocator.alloc(u8, TlsClient.min_buffer_len);
-        errdefer conn.allocator.free(tls.read_buffer);
         tls.write_buffer = try conn.allocator.alloc(u8, TlsClient.min_buffer_len);
-        errdefer conn.allocator.free(tls.write_buffer);
-        tls.ca_bundle = null;
 
         const now = std.Io.Timestamp.now(conn.io, .real);
         const ca: TlsCa = switch (conn.config.ssl_mode) {
@@ -684,11 +935,13 @@ pub const Conn = struct {
             else => .no_verification,
         };
 
+        tls.base_reader = conn.stream.reader(conn.io, conn.read_buffer);
+        tls.base_writer = conn.stream.writer(conn.io, conn.write_buffer);
         var random_buffer: [TlsClient.Options.entropy_len]u8 = undefined;
         conn.io.random(&random_buffer);
         tls.client = TlsClient.init(
-            &conn.reader.interface,
-            &conn.writer.interface,
+            &tls.base_reader.interface,
+            &tls.base_writer.interface,
             .{
                 .host = host,
                 .ca = ca,
@@ -699,10 +952,11 @@ pub const Conn = struct {
                 .allow_truncation_attacks = false,
             },
         ) catch |err| switch (err) {
-            error.WriteFailed => return conn.writer.err.?,
-            error.ReadFailed => return conn.reader.err.?,
+            error.WriteFailed => return tls.base_writer.err.?,
+            error.ReadFailed => return tls.base_reader.err.?,
             else => return err,
         };
+        tls_initialized = true;
         conn.tls = tls;
     }
 };
@@ -728,6 +982,7 @@ fn networkBufferLen(config: *const Config) usize {
 }
 
 fn collectParamTypes(allocator: std.mem.Allocator, params: []const proto.Param) ![]u32 {
+    if (params.len == 0) return allocator.dupe(u32, &.{});
     const out = try allocator.alloc(u32, params.len);
     for (params, out) |param, *oid| oid.* = param.type_oid;
     return out;
@@ -785,23 +1040,64 @@ fn parseRowDescription(arena: std.mem.Allocator, columns: *std.ArrayList(Column)
 }
 
 fn parseDataRow(arena: std.mem.Allocator, payload: []const u8) !Row {
+    const storage = try arena.dupe(u8, payload);
     var i: usize = 0;
-    const count = try readIntAt(u16, payload, &i);
+    const count = try readIntAt(u16, storage, &i);
     i += 2;
     const values = try arena.alloc(?[]const u8, count);
     for (0..count) |idx| {
-        const len = try readIntAt(i32, payload, &i);
+        const len = try readIntAt(i32, storage, &i);
         i += 4;
         if (len == -1) {
             values[idx] = null;
             continue;
         }
         if (len < 0) return error.InvalidDataRow;
-        if (payload.len - i < @as(usize, @intCast(len))) return error.InvalidDataRow;
-        values[idx] = try arena.dupe(u8, payload[i..][0..@as(usize, @intCast(len))]);
+        if (storage.len - i < @as(usize, @intCast(len))) return error.InvalidDataRow;
+        values[idx] = storage[i..][0..@as(usize, @intCast(len))];
         i += @as(usize, @intCast(len));
     }
     return .{ .values = values };
+}
+
+fn extendedQueryMessageLen(statement_name: []const u8, sql: []const u8, params: []const proto.Param, include_parse: bool) usize {
+    var len: usize = bindMessageLen("", statement_name, params) +
+        executeMessageLen("") +
+        syncMessageLen();
+    if (include_parse) {
+        len += taggedMessageLen(statement_name.len + 1 + sql.len + 1 + 2 + (4 * params.len));
+    }
+    return len;
+}
+
+fn extendedExecuteMessageLen(statement_name: []const u8, params: []const proto.Param) usize {
+    return bindMessageLen("", statement_name, params) +
+        executeMessageLen("") +
+        syncMessageLen();
+}
+
+fn bindMessageLen(portal_name: []const u8, statement_name: []const u8, params: []const proto.Param) usize {
+    var payload_len: usize = portal_name.len + 1 + statement_name.len + 1;
+    payload_len += 2 + (2 * params.len);
+    payload_len += 2;
+    for (params) |param| {
+        payload_len += 4;
+        if (param.value) |value| payload_len += value.len;
+    }
+    payload_len += 2 + 2;
+    return taggedMessageLen(payload_len);
+}
+
+fn executeMessageLen(portal_name: []const u8) usize {
+    return taggedMessageLen(portal_name.len + 1 + 4);
+}
+
+fn syncMessageLen() usize {
+    return taggedMessageLen(0);
+}
+
+fn taggedMessageLen(payload_len: usize) usize {
+    return 1 + 4 + payload_len;
 }
 
 fn parseCommandComplete(payload: []const u8) ![]const u8 {

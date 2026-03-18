@@ -12,6 +12,7 @@
 //! - `conn.query(...)` / `pool.query(...)` run SQL and return a `zpg.Result`
 //! - `conn.exec(...)` / `pool.exec(...)` run SQL and return the command tag
 //! - `conn.queryValues(...)`, `conn.execValues(...)`, and `conn.prepare(...)` expose the extended protocol
+//! - `conn.pipeline(...)` exposes pipelined simple or extended execution on one connection
 //!
 //! ## Supported today
 //!
@@ -20,8 +21,18 @@
 //! - cleartext, MD5, and SCRAM-SHA-256 auth
 //! - simple query protocol
 //! - extended protocol with prepared statements
+//! - pipelined execution on a single connection
 //! - fixed-size lazy connection pool
 //! - text and binary result decoding
+//!
+//! ## Current tradeoffs
+//!
+//! - `connect_timeout` is parsed from the URI but currently ignored on Zig
+//!   `0.16.0-dev`, because `std.Io.net` still panics when given a TCP connect
+//!   timeout
+//! - the Docker TLS integration test currently auto-skips on toolchains where
+//!   Zig std TLS fails PostgreSQL interop with `TlsUnexpectedMessage` /
+//!   `EndOfStream`
 //!
 //! ## Current non-goals
 //!
@@ -41,6 +52,7 @@ pub const Column = @import("pg/conn.zig").Column;
 pub const Value = @import("pg/conn.zig").Value;
 pub const QueryOptions = @import("pg/conn.zig").QueryOptions;
 pub const QueryProtocol = @import("pg/conn.zig").QueryProtocol;
+pub const Pipeline = @import("pg/conn.zig").Pipeline;
 pub const Statement = @import("pg/conn.zig").Statement;
 pub const Pool = @import("pg/pool.zig").Pool;
 pub const Stats = @import("pg/pool.zig").Stats;

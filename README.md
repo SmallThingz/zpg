@@ -1,6 +1,6 @@
 # zpg
 
-Dependency-free Postgres client primitives for Zig (`std.Io`-native, TLS, simple + extended protocol).
+Dependency-free Postgres client primitives for Zig (`std.Io`-native, TLS, simple + extended protocol, pipelining).
 
 ## Quick start
 
@@ -15,10 +15,14 @@ This is a library. For a tiny runnable client, see `examples/smoke.zig`.
 - Run only the throughput suite: `zig build benchmark-throughput`
 - Override benchmark settings: `zig build benchmark -- --mode throughput --throughput-workers 8 --throughput-per-worker 20000 --throughput-pipeline-depth 256 --sql "select 1"`
 
+Latency runs the one-request-at-a-time paths. Throughput runs the pipeline paths by default.
+
 The benchmark suite starts a temporary local PostgreSQL instance and compares:
 
 - `zpg` simple-query mode
 - `zpg` extended-query mode
+- `zpg` simple-pipeline mode
+- `zpg` extended-pipeline mode
 - a C++ `libpq` pipeline-mode shim
 
 Requirements for benchmarking:
@@ -38,6 +42,7 @@ Requirements for benchmarking:
 - `conn.exec(...)` / `pool.exec(...)`
 - `conn.execValues(...)` / `pool.execValues(...)`
 - `conn.prepare(...)`
+- `conn.pipeline(...)`
 
 ## Current features
 
@@ -46,6 +51,7 @@ Requirements for benchmarking:
 - cleartext, MD5, and SCRAM-SHA-256 auth
 - simple query protocol
 - extended protocol with prepared statements
+- pipelined simple and extended query execution on one connection
 - fixed-size lazy connection pool
 - text and binary result decoding
 - pool only reuses connections that are healthy and back in idle transaction state
@@ -53,6 +59,8 @@ Requirements for benchmarking:
 ## Current tradeoffs
 
 - connections left inside a transaction are discarded on release instead of being reused
+- `connect_timeout` is parsed from the URI but currently ignored on Zig `0.16.0-dev`, because `std.Io.net` still panics when a TCP connect timeout is passed through
+- the Docker TLS integration test is present, but currently auto-skips on this Zig toolchain when std TLS fails PostgreSQL interop with `TlsUnexpectedMessage` / `EndOfStream`
 
 ## Current non-goals
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zpg = @import("zpg");
 const common = @import("common.zig");
 
@@ -45,12 +46,13 @@ const ThroughputGate = struct {
     start: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
-const ThroughputWorkerArgs = struct {
+const PipelineWorkerArgs = struct {
     io: std.Io,
-    pool: *zpg.Pool,
+    url: []const u8,
     sql: []const u8,
     variant: common.ZpgVariant,
     warmup: usize,
+    depth: usize,
     samples: []u64,
     gate: *ThroughputGate,
 };
@@ -140,30 +142,32 @@ fn runLatencySuite(allocator: std.mem.Allocator, io: std.Io, url: []const u8, sh
 
 fn runThroughputSuite(allocator: std.mem.Allocator, io: std.Io, url: []const u8, shim_binary: []const u8, options: Options) !void {
     std.debug.print("suite mode=throughput sql={s}\n", .{options.sql});
+    const total_requests = options.throughput_workers * options.throughput_per_worker;
+    const pipeline_connections = @min(options.throughput_workers, options.throughput_pool);
 
-    const simple = try runZpgThroughput(
+    const simple = try runZpgPipelinedThroughput(
         allocator,
         io,
         url,
         options.sql,
         options.throughput_warmup,
-        options.throughput_workers,
-        options.throughput_per_worker,
-        options.throughput_pool,
-        .simple,
+        total_requests,
+        pipeline_connections,
+        options.throughput_pipeline_depth,
+        .simple_pipeline,
     );
     simple.print();
 
-    const extended = try runZpgThroughput(
+    const extended = try runZpgPipelinedThroughput(
         allocator,
         io,
         url,
         options.sql,
         options.throughput_warmup,
-        options.throughput_workers,
-        options.throughput_per_worker,
-        options.throughput_pool,
-        .extended,
+        total_requests,
+        pipeline_connections,
+        options.throughput_pipeline_depth,
+        .extended_pipeline,
     );
     extended.print();
 
@@ -195,86 +199,121 @@ fn runZpgLatency(
     const samples = try allocator.alloc(u64, iterations);
     defer allocator.free(samples);
 
-    const started = std.Io.Timestamp.now(io, .real);
+    const started = monoNowNs();
     for (samples) |*sample| {
-        const op_started = std.Io.Timestamp.now(io, .real);
+        const op_started = monoNowNs();
         var result = try conn.queryOpts(allocator, sql, query_options);
         result.deinit();
-        sample.* = nanosSince(op_started, io);
+        sample.* = monoNowNs() - op_started;
     }
 
-    return common.summarize(samples, nanosSince(started, io), "zpg", .latency, common.variantName(variant), .{
+    return common.summarize(samples, monoNowNs() - started, "zpg", .latency, common.variantName(variant), .{
         .warmup = warmup,
         .workers = 1,
         .connections = 1,
     });
 }
 
-fn runZpgThroughput(
+fn runZpgPipelinedThroughput(
     allocator: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
     sql: []const u8,
     warmup: usize,
-    workers: usize,
-    per_worker: usize,
-    pool_size: usize,
+    requests: usize,
+    connections: usize,
+    depth: usize,
     variant: common.ZpgVariant,
 ) !common.Summary {
-    var pool = try zpg.Pool.initUri(allocator, io, url, pool_size);
-
-    const total_requests = workers * per_worker;
-    const samples = try allocator.alloc(u64, total_requests);
+    const samples = try allocator.alloc(u64, requests);
     defer allocator.free(samples);
 
-    const threads = try allocator.alloc(std.Thread, workers);
+    const threads = try allocator.alloc(std.Thread, connections);
     defer allocator.free(threads);
 
     var gate = ThroughputGate{};
+    var assigned: usize = 0;
     for (threads, 0..) |*thread, i| {
-        const start_index = i * per_worker;
-        thread.* = try std.Thread.spawn(.{}, throughputWorkerMain, .{ThroughputWorkerArgs{
+        const remaining_threads = connections - i;
+        const remaining_requests = requests - assigned;
+        const worker_requests = @divFloor(remaining_requests + remaining_threads - 1, remaining_threads);
+        thread.* = try std.Thread.spawn(.{}, pipelineWorkerMain, .{PipelineWorkerArgs{
             .io = io,
-            .pool = &pool,
+            .url = url,
             .sql = sql,
             .variant = variant,
             .warmup = warmup,
-            .samples = samples[start_index .. start_index + per_worker],
+            .depth = depth,
+            .samples = samples[assigned .. assigned + worker_requests],
             .gate = &gate,
         }});
+        assigned += worker_requests;
     }
 
-    // Hold all workers at a single barrier so the wall clock reflects only the hot run.
-    while (gate.ready.load(.acquire) != workers) std.atomic.spinLoopHint();
+    while (gate.ready.load(.acquire) != connections) std.atomic.spinLoopHint();
 
-    const started = std.Io.Timestamp.now(io, .real);
+    const started = monoNowNs();
     gate.start.store(true, .release);
 
     for (threads) |thread| thread.join();
 
-    return common.summarize(samples, nanosSince(started, io), "zpg", .throughput, common.variantName(variant), .{
+    return common.summarize(samples, monoNowNs() - started, "zpg", .throughput, common.variantName(variant), .{
         .warmup = warmup,
-        .workers = workers,
-        .pool = pool_size,
-        .connections = pool_size,
+        .workers = connections,
+        .connections = connections,
+        .pipeline_depth = depth,
     });
 }
 
-fn throughputWorkerMain(args: ThroughputWorkerArgs) !void {
-    const query_options = queryOptions(args.variant);
-    for (0..args.warmup) |_| {
-        var result = try args.pool.queryOpts(std.heap.smp_allocator, args.sql, query_options);
-        result.deinit();
-    }
+fn pipelineWorkerMain(args: PipelineWorkerArgs) !void {
+    const allocator = std.heap.page_allocator;
+    var config = try zpg.Config.parseUri(allocator, args.url);
+    const conn = try zpg.Conn.connect(allocator, args.io, &config);
+
+    try runPipeline(args.io, conn, args.sql, args.variant, args.warmup, args.depth, null);
 
     _ = args.gate.ready.fetchAdd(1, .acq_rel);
     while (!args.gate.start.load(.acquire)) std.atomic.spinLoopHint();
 
-    for (args.samples) |*sample| {
-        const op_started = std.Io.Timestamp.now(args.io, .real);
-        var result = try args.pool.queryOpts(std.heap.smp_allocator, args.sql, query_options);
-        result.deinit();
-        sample.* = nanosSince(op_started, args.io);
+    try runPipeline(args.io, conn, args.sql, args.variant, args.samples.len, args.depth, args.samples);
+}
+
+fn runPipeline(io: std.Io, conn: *zpg.Conn, sql: []const u8, variant: common.ZpgVariant, count: usize, depth: usize, maybe_samples: ?[]u64) !void {
+    _ = io;
+    if (count == 0) return;
+
+    var pipeline = conn.pipeline(queryOptions(variant));
+    var send_times: []u64 = &.{};
+    if (maybe_samples != null) {
+        send_times = try std.heap.smp_allocator.alloc(u64, count);
+        defer std.heap.smp_allocator.free(send_times);
+    }
+
+    var sent: usize = 0;
+    var completed: usize = 0;
+
+    while (sent < count and sent - completed < depth) {
+        if (maybe_samples != null) send_times[sent] = monoNowNs();
+        try pipeline.query(sql);
+        sent += 1;
+    }
+    try pipeline.flush();
+
+    while (completed < count) {
+        try pipeline.discard();
+        if (maybe_samples) |samples| {
+            samples[completed] = monoNowNs() - send_times[completed];
+        }
+        completed += 1;
+
+        var queued_since_flush: usize = 0;
+        while (sent < count and sent - completed < depth) {
+            if (maybe_samples != null) send_times[sent] = monoNowNs();
+            try pipeline.query(sql);
+            sent += 1;
+            queued_since_flush += 1;
+        }
+        if (queued_since_flush != 0) try pipeline.flush();
     }
 }
 
@@ -369,8 +408,8 @@ fn firstSummaryLine(output: []const u8) ?[]const u8 {
 fn queryOptions(variant: common.ZpgVariant) zpg.QueryOptions {
     return .{
         .protocol = switch (variant) {
-            .simple => .simple,
-            .extended => .extended,
+            .simple, .simple_pipeline => .simple,
+            .extended, .extended_pipeline => .extended,
         },
     };
 }
@@ -386,8 +425,14 @@ fn parseUnsigned(text: []const u8) !usize {
     return std.fmt.parseInt(usize, text, 10);
 }
 
-fn nanosSince(started: std.Io.Timestamp, io: std.Io) u64 {
-    return @intCast(started.untilNow(io, .real).toNanoseconds());
+fn monoNowNs() u64 {
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts) == 0) {
+            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        }
+    }
+    return 0;
 }
 
 fn printUsage() void {
