@@ -43,6 +43,24 @@ pub const QueryOptions = struct {
     result_format: proto.FormatCode = .text,
 };
 
+pub const Date = struct {
+    year: i32,
+    month: u8,
+    day: u8,
+};
+
+pub const Time = struct {
+    hour: u8,
+    minute: u8,
+    second: u8,
+    microsecond: u32 = 0,
+};
+
+pub const Timestamp = struct {
+    date: Date,
+    time: Time,
+};
+
 pub fn CompiledResult(comptime RowT: type) type {
     return struct {
         raw: Result,
@@ -77,7 +95,13 @@ pub fn CompiledQuery(comptime sql_text: []const u8, comptime Args: type, comptim
                     .protocol = .simple,
                     .result_format = .text,
                 }),
-                .extended => blk: {
+                .extended => if (has_static_param_types)
+                    conn.execCompiled(allocator, sql_text, args, static_param_types[0..], .{
+                        .protocol = .extended,
+                        .result_format = .text,
+                    })
+                else
+                    blk: {
                     var scratch = std.heap.ArenaAllocator.init(allocator);
                     defer scratch.deinit();
                     const params = try encodeCompiledParams(scratch.allocator(), args);
@@ -85,7 +109,7 @@ pub fn CompiledQuery(comptime sql_text: []const u8, comptime Args: type, comptim
                         .protocol = .extended,
                         .result_format = .text,
                     });
-                },
+                    },
             };
         }
 
@@ -97,16 +121,26 @@ pub fn CompiledQuery(comptime sql_text: []const u8, comptime Args: type, comptim
                 },
                 .extended => {
                     if (pipeline.opts.protocol != .extended) return error.UnsupportedProtocol;
-                    var scratch = std.heap.ArenaAllocator.init(allocator);
-                    defer scratch.deinit();
-                    const params = try encodeCompiledParams(scratch.allocator(), args);
-                    try pipeline.conn.queuePipelineParameterizedQuery(
+                    if (has_static_param_types) {
+                        try pipeline.conn.queuePipelineCompiledQuery(
+                            sql_text,
+                            args,
+                            static_param_types[0..],
+                            pipeline.opts.result_format,
+                            pipeline.next_portal_id,
+                        );
+                    } else {
+                        var scratch = std.heap.ArenaAllocator.init(allocator);
+                        defer scratch.deinit();
+                        const params = try encodeCompiledParams(scratch.allocator(), args);
+                        try pipeline.conn.queuePipelineParameterizedQuery(
                         sql_text,
                         params,
                         compiledParamTypesForQuery(),
                         pipeline.opts.result_format,
                         pipeline.next_portal_id,
-                    );
+                        );
+                    }
                     pipeline.next_portal_id += 1;
                     pipeline.pending += 1;
                     pipeline.queued_since_flush += 1;
@@ -125,7 +159,13 @@ pub fn CompiledQuery(comptime sql_text: []const u8, comptime Args: type, comptim
                     .protocol = .simple,
                     .result_format = .text,
                 }),
-                .extended => blk: {
+                .extended => if (has_static_param_types)
+                    conn.queryCompiled(allocator, sql_text, args, static_param_types[0..], .{
+                        .protocol = .extended,
+                        .result_format = .text,
+                    })
+                else
+                    blk: {
                     var scratch = std.heap.ArenaAllocator.init(allocator);
                     defer scratch.deinit();
                     const params = try encodeCompiledParams(scratch.allocator(), args);
@@ -133,7 +173,7 @@ pub fn CompiledQuery(comptime sql_text: []const u8, comptime Args: type, comptim
                         .protocol = .extended,
                         .result_format = .text,
                     });
-                },
+                    },
             };
         }
 
@@ -258,12 +298,9 @@ pub const Pipeline = struct {
     }
 
     pub fn queryValues(pipeline: *Pipeline, allocator: std.mem.Allocator, sql: []const u8, values: []const Value) !void {
+        _ = allocator;
         if (pipeline.opts.protocol == .simple) return error.UnsupportedProtocol;
-
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
-        const params = try encodeValues(scratch.allocator(), values);
-        try pipeline.conn.queuePipelineParameterizedQuery(sql, params, null, pipeline.opts.result_format, pipeline.next_portal_id);
+        try pipeline.conn.queuePipelineValueQuery(sql, values, pipeline.opts.result_format, pipeline.next_portal_id);
         pipeline.next_portal_id += 1;
         pipeline.pending += 1;
         pipeline.queued_since_flush += 1;
@@ -274,12 +311,9 @@ pub const Pipeline = struct {
     }
 
     pub fn preparedQueryValues(pipeline: *Pipeline, allocator: std.mem.Allocator, statement_name: []const u8, values: []const Value) !void {
+        _ = allocator;
         if (pipeline.opts.protocol == .simple) return error.UnsupportedProtocol;
-
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
-        const params = try encodeValues(scratch.allocator(), values);
-        try pipeline.conn.queuePipelinePreparedExecute(statement_name, params, pipeline.opts.result_format, pipeline.next_portal_id);
+        try pipeline.conn.queuePipelinePreparedValueExecute(statement_name, values, pipeline.opts.result_format, pipeline.next_portal_id);
         pipeline.next_portal_id += 1;
         pipeline.pending += 1;
         pipeline.queued_since_flush += 1;
@@ -470,11 +504,13 @@ pub const Conn = struct {
 
     pub fn queueSimpleQuery(conn: *Conn, sql: []const u8) !void {
         conn.clearLastError();
+        conn.clearUnnamedStatementCache();
         try conn.writeSimpleQueryBuffered(sql);
     }
 
     pub fn queuePipelineSimpleQuery(conn: *Conn, sql: []const u8) !void {
         conn.clearLastError();
+        conn.clearUnnamedStatementCache();
         try conn.queued_simple_pipeline_sql.appendSlice(conn.allocator, sql);
         try conn.queued_simple_pipeline_sql.append(conn.allocator, ';');
     }
@@ -699,6 +735,7 @@ pub const Conn = struct {
 
     fn querySimple(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) !Result {
         conn.clearLastError();
+        conn.clearUnnamedStatementCache();
         try conn.writeSimpleQueryBuffered(sql);
         try conn.flushWrites();
         return conn.readQueryResult(allocator, false);
@@ -706,29 +743,60 @@ pub const Conn = struct {
 
     fn execSimple(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
         conn.clearLastError();
+        conn.clearUnnamedStatementCache();
         try conn.writeSimpleQueryBuffered(sql);
         try conn.flushWrites();
         return conn.readExecResult(allocator, false);
     }
 
     fn queryExtendedValues(conn: *Conn, statement_name: ?[]const u8, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) !Result {
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
-        const params = try encodeValues(scratch.allocator(), values);
         if (statement_name) |name| {
-            return conn.queryPreparedRaw(name, allocator, params, opts);
+            return conn.queryPreparedValues(name, allocator, values, opts);
         }
-        return conn.queryExtendedRaw(allocator, sql, params, opts);
+        return conn.queryExtendedDirect(allocator, sql, values, opts);
     }
 
     fn execExtendedValues(conn: *Conn, statement_name: ?[]const u8, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) ![]const u8 {
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
-        const params = try encodeValues(scratch.allocator(), values);
         if (statement_name) |name| {
-            return conn.execPreparedRaw(name, allocator, params, opts);
+            return conn.execPreparedValues(name, allocator, values, opts);
         }
-        return conn.execExtendedRaw(allocator, sql, params, opts);
+        return conn.execExtendedDirect(allocator, sql, values, opts);
+    }
+
+    fn queryCompiled(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, args: anytype, static_param_types: []const u32, opts: QueryOptions) !Result {
+        conn.clearLastError();
+        try conn.sendCompiledExtendedQuery("", sql, args, static_param_types, opts.result_format, true);
+        return conn.readQueryResult(allocator, true);
+    }
+
+    fn execCompiled(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, args: anytype, static_param_types: []const u32, opts: QueryOptions) ![]const u8 {
+        conn.clearLastError();
+        try conn.sendCompiledExtendedQuery("", sql, args, static_param_types, opts.result_format, true);
+        return conn.readExecResult(allocator, true);
+    }
+
+    fn queryExtendedDirect(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) !Result {
+        conn.clearLastError();
+        try conn.sendValueExtendedQuery("", sql, values, opts.result_format, true);
+        return conn.readQueryResult(allocator, true);
+    }
+
+    fn queryPreparedValues(conn: *Conn, statement_name: []const u8, allocator: std.mem.Allocator, values: []const Value, opts: QueryOptions) !Result {
+        conn.clearLastError();
+        try conn.sendValueExtendedExecute(statement_name, values, opts.result_format);
+        return conn.readQueryResult(allocator, true);
+    }
+
+    fn execExtendedDirect(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) ![]const u8 {
+        conn.clearLastError();
+        try conn.sendValueExtendedQuery("", sql, values, opts.result_format, true);
+        return conn.readExecResult(allocator, true);
+    }
+
+    fn execPreparedValues(conn: *Conn, statement_name: []const u8, allocator: std.mem.Allocator, values: []const Value, opts: QueryOptions) ![]const u8 {
+        conn.clearLastError();
+        try conn.sendValueExtendedExecute(statement_name, values, opts.result_format);
+        return conn.readExecResult(allocator, true);
     }
 
     fn queryExtendedRaw(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, params: []const proto.Param, opts: QueryOptions) !Result {
@@ -768,6 +836,16 @@ pub const Conn = struct {
         try conn.flushWrites();
     }
 
+    fn sendValueExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, values: []const Value, result_format: proto.FormatCode, include_parse: bool) !void {
+        try conn.queueValueExtendedQuery(statement_name, sql, values, result_format, include_parse);
+        try conn.flushWrites();
+    }
+
+    fn sendCompiledExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, args: anytype, static_param_types: []const u32, result_format: proto.FormatCode, include_parse: bool) !void {
+        try conn.queueCompiledExtendedQuery(statement_name, sql, args, static_param_types, result_format, include_parse);
+        try conn.flushWrites();
+    }
+
     fn queueExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, params: []const proto.Param, param_types_override: ?[]const u32, result_format: proto.FormatCode, include_parse: bool) !void {
         const cache_unnamed = statement_name.len == 0 and include_parse;
         var param_types: []u32 = &.{};
@@ -796,6 +874,44 @@ pub const Conn = struct {
         try proto.appendExecute(&conn.queued_writes, conn.allocator, "", 0);
         try proto.appendSync(&conn.queued_writes, conn.allocator);
         if (cache_unnamed and need_parse) try conn.updateUnnamedStatementCache(sql, param_types);
+    }
+
+    fn queueValueExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, values: []const Value, result_format: proto.FormatCode, include_parse: bool) !void {
+        const cache_unnamed = statement_name.len == 0 and include_parse;
+        var need_parse = include_parse;
+        if (cache_unnamed) {
+            need_parse = !conn.matchesUnnamedStatementValues(sql, values);
+        }
+        const parse_type_count = if (need_parse) values.len else 0;
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try valueExtendedQueryMessageLenFor("", statement_name, sql, values, parse_type_count, need_parse, true));
+        if (need_parse) {
+            appendParseValuesAssumeCapacity(&conn.queued_writes, statement_name, sql, values);
+        }
+        try appendBindValuesAssumeCapacity(&conn.queued_writes, "", statement_name, values, result_format);
+        appendExecuteAssumeCapacity(&conn.queued_writes, "", 0);
+        appendSyncAssumeCapacity(&conn.queued_writes);
+        if (cache_unnamed and need_parse) try conn.updateUnnamedStatementCacheFromValues(sql, values);
+    }
+
+    fn queueCompiledExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, args: anytype, static_param_types: []const u32, result_format: proto.FormatCode, include_parse: bool) !void {
+        const cache_unnamed = statement_name.len == 0 and include_parse;
+        var need_parse = include_parse;
+        if (cache_unnamed) {
+            need_parse = !conn.matchesUnnamedStatement(sql, static_param_types);
+        }
+        const parse_type_count = if (need_parse) static_param_types.len else 0;
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try compiledExtendedQueryMessageLenFor("", statement_name, sql, args, parse_type_count, need_parse, true));
+        if (need_parse) {
+            appendParseStaticTypesAssumeCapacity(&conn.queued_writes, statement_name, sql, static_param_types);
+        }
+        try appendBindCompiledArgsAssumeCapacity(&conn.queued_writes, "", statement_name, args, result_format);
+        appendExecuteAssumeCapacity(&conn.queued_writes, "", 0);
+        appendSyncAssumeCapacity(&conn.queued_writes);
+        if (cache_unnamed and need_parse) try conn.updateUnnamedStatementCache(sql, static_param_types);
     }
 
     fn queuePipelineParameterizedQuery(conn: *Conn, sql: []const u8, params: []const proto.Param, param_types_override: ?[]const u32, result_format: proto.FormatCode, portal_id: u64) !void {
@@ -827,12 +943,59 @@ pub const Conn = struct {
         if (needs_parse) try conn.updatePipelineStatementCache(sql, owned_param_types);
     }
 
+    fn queuePipelineValueQuery(conn: *Conn, sql: []const u8, values: []const Value, result_format: proto.FormatCode, portal_id: u64) !void {
+        const statement_name = "s";
+        var portal_buf: [18]u8 = undefined;
+        const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
+        const needs_parse = !conn.matchesPipelineStatementValues(sql, values);
+
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try valueExtendedQueryMessageLenFor(portal_name, statement_name, sql, values, if (needs_parse) values.len else 0, needs_parse, false) + closeMessageLen(statement_name, needs_parse and conn.pipeline_statement_sql.len != 0));
+
+        if (needs_parse and conn.pipeline_statement_sql.len != 0) {
+            appendCloseAssumeCapacity(&conn.queued_writes, .statement, statement_name);
+        }
+        if (needs_parse) {
+            appendParseValuesAssumeCapacity(&conn.queued_writes, statement_name, sql, values);
+        }
+        try appendBindValuesAssumeCapacity(&conn.queued_writes, portal_name, statement_name, values, result_format);
+        appendExecuteAssumeCapacity(&conn.queued_writes, portal_name, 0);
+        if (needs_parse) try conn.updatePipelineStatementCacheFromValues(sql, values);
+    }
+
+    fn queuePipelineCompiledQuery(conn: *Conn, sql: []const u8, args: anytype, static_param_types: []const u32, result_format: proto.FormatCode, portal_id: u64) !void {
+        const statement_name = "s";
+        var portal_buf: [18]u8 = undefined;
+        const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
+        const needs_parse = !conn.matchesPipelineStatement(sql, static_param_types);
+
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try compiledExtendedQueryMessageLenFor(portal_name, statement_name, sql, args, if (needs_parse) static_param_types.len else 0, needs_parse, false) + closeMessageLen(statement_name, needs_parse and conn.pipeline_statement_sql.len != 0));
+
+        if (needs_parse and conn.pipeline_statement_sql.len != 0) {
+            appendCloseAssumeCapacity(&conn.queued_writes, .statement, statement_name);
+        }
+        if (needs_parse) {
+            appendParseStaticTypesAssumeCapacity(&conn.queued_writes, statement_name, sql, static_param_types);
+        }
+        try appendBindCompiledArgsAssumeCapacity(&conn.queued_writes, portal_name, statement_name, args, result_format);
+        appendExecuteAssumeCapacity(&conn.queued_writes, portal_name, 0);
+        if (needs_parse) try conn.updatePipelineStatementCache(sql, static_param_types);
+    }
+
     fn queuePipelineCachedQuery(conn: *Conn, sql: []const u8, result_format: proto.FormatCode, portal_id: u64) !void {
         try conn.queuePipelineParameterizedQuery(sql, &.{}, &.{}, result_format, portal_id);
     }
 
     fn sendExtendedExecute(conn: *Conn, statement_name: []const u8, params: []const proto.Param, result_format: proto.FormatCode) !void {
         try conn.queueExtendedExecute(statement_name, params, result_format);
+        try conn.flushWrites();
+    }
+
+    fn sendValueExtendedExecute(conn: *Conn, statement_name: []const u8, values: []const Value, result_format: proto.FormatCode) !void {
+        try conn.queueValueExtendedExecute(statement_name, values, result_format);
         try conn.flushWrites();
     }
 
@@ -845,6 +1008,15 @@ pub const Conn = struct {
         try proto.appendSync(&conn.queued_writes, conn.allocator);
     }
 
+    fn queueValueExtendedExecute(conn: *Conn, statement_name: []const u8, values: []const Value, result_format: proto.FormatCode) !void {
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try valueExtendedExecuteMessageLenFor("", statement_name, values, true));
+        try appendBindValuesAssumeCapacity(&conn.queued_writes, "", statement_name, values, result_format);
+        appendExecuteAssumeCapacity(&conn.queued_writes, "", 0);
+        appendSyncAssumeCapacity(&conn.queued_writes);
+    }
+
     fn queuePipelinePreparedExecute(conn: *Conn, statement_name: []const u8, params: []const proto.Param, result_format: proto.FormatCode, portal_id: u64) !void {
         var portal_buf: [18]u8 = undefined;
         const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
@@ -853,6 +1025,16 @@ pub const Conn = struct {
         try conn.queued_writes.ensureUnusedCapacity(conn.allocator, extendedExecuteMessageLenFor(portal_name, statement_name, params, false));
         try proto.appendBind(&conn.queued_writes, conn.allocator, portal_name, statement_name, params, result_format);
         try proto.appendExecute(&conn.queued_writes, conn.allocator, portal_name, 0);
+    }
+
+    fn queuePipelinePreparedValueExecute(conn: *Conn, statement_name: []const u8, values: []const Value, result_format: proto.FormatCode, portal_id: u64) !void {
+        var portal_buf: [18]u8 = undefined;
+        const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try valueExtendedExecuteMessageLenFor(portal_name, statement_name, values, false));
+        try appendBindValuesAssumeCapacity(&conn.queued_writes, portal_name, statement_name, values, result_format);
+        appendExecuteAssumeCapacity(&conn.queued_writes, portal_name, 0);
     }
 
     fn readQueryResult(conn: *Conn, allocator: std.mem.Allocator, extended: bool) !Result {
@@ -1144,6 +1326,24 @@ pub const Conn = struct {
             std.mem.eql(u32, conn.pipeline_statement_param_types, param_types);
     }
 
+    fn matchesUnnamedStatementValues(conn: *const Conn, sql: []const u8, values: []const Value) bool {
+        if (!std.mem.eql(u8, conn.unnamed_statement_sql, sql)) return false;
+        if (conn.unnamed_statement_param_types.len != values.len) return false;
+        for (values, conn.unnamed_statement_param_types) |value, expected_oid| {
+            if (expected_oid != runtimeValueTypeOid(value)) return false;
+        }
+        return true;
+    }
+
+    fn matchesPipelineStatementValues(conn: *const Conn, sql: []const u8, values: []const Value) bool {
+        if (!std.mem.eql(u8, conn.pipeline_statement_sql, sql)) return false;
+        if (conn.pipeline_statement_param_types.len != values.len) return false;
+        for (values, conn.pipeline_statement_param_types) |value, expected_oid| {
+            if (expected_oid != runtimeValueTypeOid(value)) return false;
+        }
+        return true;
+    }
+
     fn updateUnnamedStatementCache(conn: *Conn, sql: []const u8, param_types: []const u32) !void {
         conn.clearUnnamedStatementCache();
         conn.unnamed_statement_sql = try conn.allocator.dupe(u8, sql);
@@ -1162,6 +1362,28 @@ pub const Conn = struct {
             conn.pipeline_statement_sql = &.{};
         }
         conn.pipeline_statement_param_types = try conn.allocator.dupe(u32, param_types);
+    }
+
+    fn updateUnnamedStatementCacheFromValues(conn: *Conn, sql: []const u8, values: []const Value) !void {
+        conn.clearUnnamedStatementCache();
+        conn.unnamed_statement_sql = try conn.allocator.dupe(u8, sql);
+        errdefer {
+            conn.allocator.free(conn.unnamed_statement_sql);
+            conn.unnamed_statement_sql = &.{};
+        }
+        conn.unnamed_statement_param_types = try conn.allocator.alloc(u32, values.len);
+        for (values, conn.unnamed_statement_param_types) |value, *oid| oid.* = runtimeValueTypeOid(value);
+    }
+
+    fn updatePipelineStatementCacheFromValues(conn: *Conn, sql: []const u8, values: []const Value) !void {
+        conn.clearPipelineStatementCache();
+        conn.pipeline_statement_sql = try conn.allocator.dupe(u8, sql);
+        errdefer {
+            conn.allocator.free(conn.pipeline_statement_sql);
+            conn.pipeline_statement_sql = &.{};
+        }
+        conn.pipeline_statement_param_types = try conn.allocator.alloc(u32, values.len);
+        for (values, conn.pipeline_statement_param_types) |value, *oid| oid.* = runtimeValueTypeOid(value);
     }
 
     fn setLastError(conn: *Conn, payload: []const u8) !void {
@@ -1388,6 +1610,345 @@ fn networkBufferLen(config: *const Config) usize {
     return if (config.ssl_mode == .disable) base else @max(base, TlsClient.min_buffer_len);
 }
 
+fn appendAssumeCapacity(out: *std.ArrayList(u8), byte: u8) void {
+    out.appendAssumeCapacity(byte);
+}
+
+fn appendSliceAssumeCapacity(out: *std.ArrayList(u8), bytes: []const u8) void {
+    out.appendSliceAssumeCapacity(bytes);
+}
+
+fn appendIntAssumeCapacity(out: *std.ArrayList(u8), comptime T: type, value: T) void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .big);
+    appendSliceAssumeCapacity(out, &bytes);
+}
+
+fn appendTaggedHeaderAssumeCapacity(out: *std.ArrayList(u8), tag: u8, payload_len: usize) void {
+    appendAssumeCapacity(out, tag);
+    appendIntAssumeCapacity(out, u32, @as(u32, @intCast(payload_len + 4)));
+}
+
+fn appendCStringAssumeCapacity(out: *std.ArrayList(u8), text: []const u8) void {
+    appendSliceAssumeCapacity(out, text);
+    appendAssumeCapacity(out, 0);
+}
+
+fn appendParseStaticTypesAssumeCapacity(out: *std.ArrayList(u8), statement_name: []const u8, sql: []const u8, param_types: []const u32) void {
+    const payload_len = statement_name.len + 1 + sql.len + 1 + 2 + (4 * param_types.len);
+    appendTaggedHeaderAssumeCapacity(out, 'P', payload_len);
+    appendCStringAssumeCapacity(out, statement_name);
+    appendCStringAssumeCapacity(out, sql);
+    appendIntAssumeCapacity(out, u16, @as(u16, @intCast(param_types.len)));
+    for (param_types) |oid| appendIntAssumeCapacity(out, u32, oid);
+}
+
+fn appendParseValuesAssumeCapacity(out: *std.ArrayList(u8), statement_name: []const u8, sql: []const u8, values: []const Value) void {
+    const payload_len = statement_name.len + 1 + sql.len + 1 + 2 + (4 * values.len);
+    appendTaggedHeaderAssumeCapacity(out, 'P', payload_len);
+    appendCStringAssumeCapacity(out, statement_name);
+    appendCStringAssumeCapacity(out, sql);
+    appendIntAssumeCapacity(out, u16, @as(u16, @intCast(values.len)));
+    for (values) |value| appendIntAssumeCapacity(out, u32, runtimeValueTypeOid(value));
+}
+
+fn appendExecuteAssumeCapacity(out: *std.ArrayList(u8), portal_name: []const u8, max_rows: u32) void {
+    appendTaggedHeaderAssumeCapacity(out, 'E', portal_name.len + 1 + 4);
+    appendCStringAssumeCapacity(out, portal_name);
+    appendIntAssumeCapacity(out, u32, max_rows);
+}
+
+fn appendSyncAssumeCapacity(out: *std.ArrayList(u8)) void {
+    appendTaggedHeaderAssumeCapacity(out, 'S', 0);
+}
+
+fn appendCloseAssumeCapacity(out: *std.ArrayList(u8), target: proto.CloseTarget, name: []const u8) void {
+    appendTaggedHeaderAssumeCapacity(out, 'C', 1 + name.len + 1);
+    appendAssumeCapacity(out, @intFromEnum(target));
+    appendCStringAssumeCapacity(out, name);
+}
+
+fn runtimeValueTypeOid(value: Value) u32 {
+    return switch (value) {
+        .null => 0,
+        .typed_null => |oid| oid,
+        .bool => 16,
+        .int2, .uint2 => 21,
+        .int4, .uint4 => 23,
+        .int8, .uint8 => 20,
+        .float4 => 700,
+        .float8 => 701,
+        .text => 25,
+        .bytea => 17,
+        .raw_text => 0,
+        .raw_binary => |v| v.type_oid,
+    };
+}
+
+fn runtimeValueFormat(value: Value) proto.FormatCode {
+    return switch (value) {
+        .bool,
+        .int2,
+        .int4,
+        .int8,
+        .uint2,
+        .uint4,
+        .uint8,
+        .float4,
+        .float8,
+        .bytea,
+        .raw_binary,
+        => .binary,
+        else => .text,
+    };
+}
+
+fn runtimeValueEncodedLen(value: Value) !?usize {
+    return switch (value) {
+        .null, .typed_null => null,
+        .bool => 1,
+        .int2, .uint2 => 2,
+        .int4, .uint4, .float4 => 4,
+        .int8, .uint8, .float8 => 8,
+        .text => |v| v.len,
+        .bytea => |v| v.len,
+        .raw_text => |v| v.len,
+        .raw_binary => |v| v.bytes.len,
+    };
+}
+
+fn appendRuntimeValueBytesAssumeCapacity(out: *std.ArrayList(u8), value: Value) !void {
+    switch (value) {
+        .null, .typed_null => {},
+        .bool => |v| appendAssumeCapacity(out, if (v) 1 else 0),
+        .int2 => |v| appendIntAssumeCapacity(out, i16, v),
+        .int4 => |v| appendIntAssumeCapacity(out, i32, v),
+        .int8 => |v| appendIntAssumeCapacity(out, i64, v),
+        .uint2 => |v| appendIntAssumeCapacity(out, i16, std.math.cast(i16, v) orelse return error.ValueOverflow),
+        .uint4 => |v| appendIntAssumeCapacity(out, i32, std.math.cast(i32, v) orelse return error.ValueOverflow),
+        .uint8 => |v| appendIntAssumeCapacity(out, i64, std.math.cast(i64, v) orelse return error.ValueOverflow),
+        .float4 => |v| appendIntAssumeCapacity(out, u32, @bitCast(v)),
+        .float8 => |v| appendIntAssumeCapacity(out, u64, @bitCast(v)),
+        .text => |v| appendSliceAssumeCapacity(out, v),
+        .bytea => |v| appendSliceAssumeCapacity(out, v),
+        .raw_text => |v| appendSliceAssumeCapacity(out, v),
+        .raw_binary => |v| appendSliceAssumeCapacity(out, v.bytes),
+    }
+}
+
+fn valueBindMessageLen(portal_name: []const u8, statement_name: []const u8, values: []const Value) !usize {
+    var payload_len: usize = portal_name.len + 1 + statement_name.len + 1;
+    payload_len += 2 + (2 * values.len);
+    payload_len += 2;
+    for (values) |value| {
+        payload_len += 4;
+        if (try runtimeValueEncodedLen(value)) |len| payload_len += len;
+    }
+    payload_len += 2 + 2;
+    return taggedMessageLen(payload_len);
+}
+
+fn valueExtendedQueryMessageLenFor(portal_name: []const u8, statement_name: []const u8, sql: []const u8, values: []const Value, parse_param_type_count: usize, include_parse: bool, include_sync: bool) !usize {
+    var len = try valueExtendedExecuteMessageLenFor(portal_name, statement_name, values, include_sync);
+    if (include_parse) len += taggedMessageLen(statement_name.len + 1 + sql.len + 1 + 2 + (4 * parse_param_type_count));
+    return len;
+}
+
+fn valueExtendedExecuteMessageLenFor(portal_name: []const u8, statement_name: []const u8, values: []const Value, include_sync: bool) !usize {
+    var len = try valueBindMessageLen(portal_name, statement_name, values) + executeMessageLen(portal_name);
+    if (include_sync) len += syncMessageLen();
+    return len;
+}
+
+fn appendBindValuesAssumeCapacity(out: *std.ArrayList(u8), portal_name: []const u8, statement_name: []const u8, values: []const Value, result_format: proto.FormatCode) !void {
+    const payload_len = (try valueBindMessageLen(portal_name, statement_name, values)) - 5;
+    appendTaggedHeaderAssumeCapacity(out, 'B', payload_len);
+    appendCStringAssumeCapacity(out, portal_name);
+    appendCStringAssumeCapacity(out, statement_name);
+    appendIntAssumeCapacity(out, u16, @as(u16, @intCast(values.len)));
+    for (values) |value| appendIntAssumeCapacity(out, u16, @intFromEnum(runtimeValueFormat(value)));
+    appendIntAssumeCapacity(out, u16, @as(u16, @intCast(values.len)));
+    for (values) |value| {
+        if (try runtimeValueEncodedLen(value)) |len| {
+            appendIntAssumeCapacity(out, i32, @as(i32, @intCast(len)));
+            try appendRuntimeValueBytesAssumeCapacity(out, value);
+        } else {
+            appendIntAssumeCapacity(out, i32, -1);
+        }
+    }
+    appendIntAssumeCapacity(out, u16, 1);
+    appendIntAssumeCapacity(out, u16, @intFromEnum(result_format));
+}
+
+fn compiledArgFormat(comptime T: type) proto.FormatCode {
+    if (T == [16]u8 or T == Date or T == Time or T == Timestamp) return .binary;
+    return switch (@typeInfo(T)) {
+        .optional => |opt| compiledArgFormat(opt.child),
+        .bool, .int, .float => .binary,
+        .pointer => .text,
+        .array => .text,
+        else => @compileError("unsupported compiled query argument type"),
+    };
+}
+
+fn compiledArgEncodedLen(arg: anytype) !?usize {
+    const T = @TypeOf(arg);
+    if (T == [16]u8) return 16;
+    if (T == Date) {
+        try validateDate(arg.year, arg.month, arg.day);
+        return 4;
+    }
+    if (T == Time) {
+        try validateTime(arg.hour, arg.minute, arg.second);
+        if (arg.microsecond >= std.time.us_per_s) return error.BadValue;
+        return 8;
+    }
+    if (T == Timestamp) {
+        try validateDate(arg.date.year, arg.date.month, arg.date.day);
+        try validateTime(arg.time.hour, arg.time.minute, arg.time.second);
+        if (arg.time.microsecond >= std.time.us_per_s) return error.BadValue;
+        return 8;
+    }
+
+    return switch (@typeInfo(T)) {
+        .optional => if (arg) |value| try compiledArgEncodedLen(value) else null,
+        .bool => 1,
+        .int => |info| switch (info.bits) {
+            0...16 => 2,
+            17...32 => 4,
+            33...64 => 8,
+            else => @compileError("compiled query integer arguments must fit within 64 bits"),
+        },
+        .float => |info| switch (info.bits) {
+            32 => 4,
+            64 => 8,
+            else => @compileError("compiled query float arguments must be f32 or f64"),
+        },
+        .pointer => |info| switch (info.size) {
+            .slice => if (info.child == u8) arg.len else @compileError("compiled query slice arguments must be []const u8 or []u8"),
+            else => @compileError("compiled query pointer arguments must be slices"),
+        },
+        .array => |info| if (info.child == u8) arg.len else @compileError("compiled query array arguments must be [N]u8"),
+        else => @compileError("unsupported compiled query argument type"),
+    };
+}
+
+fn appendCompiledArgBytesAssumeCapacity(out: *std.ArrayList(u8), arg: anytype) !void {
+    const T = @TypeOf(arg);
+    if (T == [16]u8) {
+        appendSliceAssumeCapacity(out, arg[0..]);
+        return;
+    }
+    if (T == Date) {
+        try validateDate(arg.year, arg.month, arg.day);
+        appendIntAssumeCapacity(out, i32, @intCast(daysFromCivil(arg.year, arg.month, arg.day) - pg_unix_epoch_days));
+        return;
+    }
+    if (T == Time) {
+        try validateTime(arg.hour, arg.minute, arg.second);
+        if (arg.microsecond >= std.time.us_per_s) return error.BadValue;
+        const micros =
+            @as(i64, arg.hour) * std.time.us_per_hour +
+            @as(i64, arg.minute) * std.time.us_per_min +
+            @as(i64, arg.second) * std.time.us_per_s +
+            @as(i64, arg.microsecond);
+        appendIntAssumeCapacity(out, i64, micros);
+        return;
+    }
+    if (T == Timestamp) {
+        try validateDate(arg.date.year, arg.date.month, arg.date.day);
+        try validateTime(arg.time.hour, arg.time.minute, arg.time.second);
+        if (arg.time.microsecond >= std.time.us_per_s) return error.BadValue;
+        appendIntAssumeCapacity(out, i64, unixMicrosFromTimestamp(arg) - pg_unix_epoch_micros);
+        return;
+    }
+
+    switch (@typeInfo(T)) {
+        .optional => if (arg) |value| try appendCompiledArgBytesAssumeCapacity(out, value),
+        .bool => appendAssumeCapacity(out, if (arg) 1 else 0),
+        .int => |info| switch (info.bits) {
+            0...16 => if (info.signedness == .signed)
+                appendIntAssumeCapacity(out, i16, @as(i16, @intCast(arg)))
+            else
+                appendIntAssumeCapacity(out, i16, std.math.cast(i16, arg) orelse return error.ValueOverflow),
+            17...32 => if (info.signedness == .signed)
+                appendIntAssumeCapacity(out, i32, @as(i32, @intCast(arg)))
+            else
+                appendIntAssumeCapacity(out, i32, std.math.cast(i32, arg) orelse return error.ValueOverflow),
+            33...64 => if (info.signedness == .signed)
+                appendIntAssumeCapacity(out, i64, @as(i64, @intCast(arg)))
+            else
+                appendIntAssumeCapacity(out, i64, std.math.cast(i64, arg) orelse return error.ValueOverflow),
+            else => @compileError("compiled query integer arguments must fit within 64 bits"),
+        },
+        .float => |info| switch (info.bits) {
+            32 => appendIntAssumeCapacity(out, u32, @bitCast(arg)),
+            64 => appendIntAssumeCapacity(out, u64, @bitCast(arg)),
+            else => @compileError("compiled query float arguments must be f32 or f64"),
+        },
+        .pointer => |info| switch (info.size) {
+            .slice => if (info.child == u8)
+                appendSliceAssumeCapacity(out, arg)
+            else
+                @compileError("compiled query slice arguments must be []const u8 or []u8"),
+            else => @compileError("compiled query pointer arguments must be slices"),
+        },
+        .array => |info| if (info.child == u8)
+            appendSliceAssumeCapacity(out, arg[0..])
+        else
+            @compileError("compiled query array arguments must be [N]u8"),
+        else => @compileError("unsupported compiled query argument type"),
+    }
+}
+
+fn compiledBindMessageLen(portal_name: []const u8, statement_name: []const u8, args: anytype) !usize {
+    const fields = std.meta.fields(@TypeOf(args));
+    var payload_len: usize = portal_name.len + 1 + statement_name.len + 1;
+    payload_len += 2 + (2 * fields.len);
+    payload_len += 2;
+    inline for (fields) |field| {
+        payload_len += 4;
+        if (try compiledArgEncodedLen(@field(args, field.name))) |len| payload_len += len;
+    }
+    payload_len += 2 + 2;
+    return taggedMessageLen(payload_len);
+}
+
+fn compiledExtendedQueryMessageLenFor(portal_name: []const u8, statement_name: []const u8, sql: []const u8, args: anytype, parse_param_type_count: usize, include_parse: bool, include_sync: bool) !usize {
+    var len = try compiledExtendedExecuteMessageLenFor(portal_name, statement_name, args, include_sync);
+    if (include_parse) len += taggedMessageLen(statement_name.len + 1 + sql.len + 1 + 2 + (4 * parse_param_type_count));
+    return len;
+}
+
+fn compiledExtendedExecuteMessageLenFor(portal_name: []const u8, statement_name: []const u8, args: anytype, include_sync: bool) !usize {
+    var len = try compiledBindMessageLen(portal_name, statement_name, args) + executeMessageLen(portal_name);
+    if (include_sync) len += syncMessageLen();
+    return len;
+}
+
+fn appendBindCompiledArgsAssumeCapacity(out: *std.ArrayList(u8), portal_name: []const u8, statement_name: []const u8, args: anytype, result_format: proto.FormatCode) !void {
+    const fields = std.meta.fields(@TypeOf(args));
+    const payload_len = (try compiledBindMessageLen(portal_name, statement_name, args)) - 5;
+    appendTaggedHeaderAssumeCapacity(out, 'B', payload_len);
+    appendCStringAssumeCapacity(out, portal_name);
+    appendCStringAssumeCapacity(out, statement_name);
+    appendIntAssumeCapacity(out, u16, @as(u16, @intCast(fields.len)));
+    inline for (fields) |field| {
+        appendIntAssumeCapacity(out, u16, @intFromEnum(compiledArgFormat(field.type)));
+    }
+    appendIntAssumeCapacity(out, u16, @as(u16, @intCast(fields.len)));
+    inline for (fields) |field| {
+        if (try compiledArgEncodedLen(@field(args, field.name))) |len| {
+            appendIntAssumeCapacity(out, i32, @as(i32, @intCast(len)));
+            try appendCompiledArgBytesAssumeCapacity(out, @field(args, field.name));
+        } else {
+            appendIntAssumeCapacity(out, i32, -1);
+        }
+    }
+    appendIntAssumeCapacity(out, u16, 1);
+    appendIntAssumeCapacity(out, u16, @intFromEnum(result_format));
+}
+
 fn validateCompiledQuerySpec(comptime sql_text: []const u8, comptime Args: type, comptime RowT: type) void {
     comptime {
         const expected_params = sqlPlaceholderCount(sql_text);
@@ -1436,6 +1997,10 @@ fn compiledStaticParamTypes(comptime Args: type) [compiledArgCount(Args)]u32 {
 
 fn compiledStaticArgTypeOid(comptime T: type) ?u32 {
     if (T == Value) return null;
+    if (T == Date) return 1082;
+    if (T == Time) return 1083;
+    if (T == Timestamp) return 1114;
+    if (T == [16]u8) return 2950;
     return switch (@typeInfo(T)) {
         .optional => |opt| compiledStaticArgTypeOid(opt.child),
         .bool => 16,
@@ -1455,7 +2020,7 @@ fn compiledStaticArgTypeOid(comptime T: type) ?u32 {
             else => @compileError("compiled query pointer arguments must be slices"),
         },
         .array => |info| if (info.child == u8) 25 else @compileError("compiled query array arguments must be [N]u8"),
-        else => @compileError("unsupported compiled query argument type; use scalars, byte/text slices, optionals, or zpg.Value"),
+        else => @compileError("unsupported compiled query argument type; use scalars, temporal/uuid types, byte/text slices, optionals, or zpg.Value"),
     };
 }
 
@@ -1593,6 +2158,33 @@ fn compiledArgToParam(allocator: std.mem.Allocator, arg: anytype) !proto.Param {
         .raw_text => |v| .{ .value = v },
         .raw_binary => |v| .{ .type_oid = v.type_oid, .format = .binary, .value = v.bytes },
     };
+    if (T == [16]u8) return .{ .type_oid = 2950, .format = .binary, .value = try allocator.dupe(u8, arg[0..]) };
+    if (T == Date) {
+        try validateDate(arg.year, arg.month, arg.day);
+        var bytes = try allocator.alloc(u8, 4);
+        std.mem.writeInt(i32, bytes[0..4], @intCast(daysFromCivil(arg.year, arg.month, arg.day) - pg_unix_epoch_days), .big);
+        return .{ .type_oid = 1082, .format = .binary, .value = bytes };
+    }
+    if (T == Time) {
+        try validateTime(arg.hour, arg.minute, arg.second);
+        if (arg.microsecond >= std.time.us_per_s) return error.BadValue;
+        var bytes = try allocator.alloc(u8, 8);
+        const micros =
+            @as(i64, arg.hour) * std.time.us_per_hour +
+            @as(i64, arg.minute) * std.time.us_per_min +
+            @as(i64, arg.second) * std.time.us_per_s +
+            @as(i64, arg.microsecond);
+        std.mem.writeInt(i64, bytes[0..8], micros, .big);
+        return .{ .type_oid = 1083, .format = .binary, .value = bytes };
+    }
+    if (T == Timestamp) {
+        try validateDate(arg.date.year, arg.date.month, arg.date.day);
+        try validateTime(arg.time.hour, arg.time.minute, arg.time.second);
+        if (arg.time.microsecond >= std.time.us_per_s) return error.BadValue;
+        var bytes = try allocator.alloc(u8, 8);
+        std.mem.writeInt(i64, bytes[0..8], unixMicrosFromTimestamp(arg) - pg_unix_epoch_micros, .big);
+        return .{ .type_oid = 1114, .format = .binary, .value = bytes };
+    }
 
     return switch (@typeInfo(T)) {
         .optional => if (arg) |value|
@@ -1830,6 +2422,15 @@ fn readIntAt(comptime T: type, payload: []const u8, index: *usize) !T {
 }
 
 fn decodeTextValue(comptime T: type, raw: []const u8) !T {
+    if (T == Date) return parseDateText(raw);
+    if (T == Time) {
+        const parsed = try parseTimeText(raw);
+        if (parsed.offset_seconds != null or parsed.consumed != raw.len) return error.BadValue;
+        return parsed.time;
+    }
+    if (T == Timestamp) return parseTimestampText(raw);
+    if (T == [16]u8) return parseUuidText(raw);
+
     return switch (@typeInfo(T)) {
         .bool => switch (raw.len) {
             1 => switch (raw[0]) {
@@ -1853,11 +2454,10 @@ fn decodeTextValue(comptime T: type, raw: []const u8) !T {
 }
 
 fn decodeBinaryValue(comptime T: type, type_oid: u32, raw: []const u8) !T {
-    if (T == []const u8) return raw;
-    if (T == [16]u8) {
-        if (raw.len != 16) return error.InvalidBinaryValue;
-        return raw[0..16].*;
-    }
+    if (T == Date and type_oid == 1082) return decodeBinaryDate(raw);
+    if (T == Time and type_oid == 1083) return decodeBinaryTime(raw);
+    if (T == Timestamp and (type_oid == 1114 or type_oid == 1184)) return decodeBinaryTimestamp(raw);
+    if (T == [16]u8 and type_oid == 2950) return decodeBinaryUuid(raw);
     return switch (type_oid) {
         16 => blk: {
             if (T != bool or raw.len != 1) return error.TypeMismatch;
@@ -1868,21 +2468,23 @@ fn decodeBinaryValue(comptime T: type, type_oid: u32, raw: []const u8) !T {
         23 => decodeBinaryInt(T, i32, raw),
         700 => decodeBinaryFloat(T, u32, f32, raw),
         701 => decodeBinaryFloat(T, u64, f64, raw),
-        17, 25, 1043, 114, 3802, 2950 => if (T == []const u8 or T == [16]u8)
-            decodeTextCompatibleBinary(T, raw)
+        17, 25, 1043, 114 => if (T == []const u8)
+            raw
+        else
+            error.TypeMismatch,
+        3802 => decodeBinaryJsonb(T, raw),
+        2950 => if (T == []const u8)
+            raw
         else
             error.TypeMismatch,
         else => error.UnsupportedBinaryType,
     };
 }
 
-fn decodeTextCompatibleBinary(comptime T: type, raw: []const u8) !T {
-    if (T == []const u8) return raw;
-    if (T == [16]u8) {
-        if (raw.len != 16) return error.InvalidBinaryValue;
-        return raw[0..16].*;
-    }
-    return error.UnsupportedDecode;
+fn decodeBinaryJsonb(comptime T: type, raw: []const u8) !T {
+    if (T != []const u8) return error.TypeMismatch;
+    if (raw.len == 0 or raw[0] != 1) return error.InvalidBinaryValue;
+    return raw[1..];
 }
 
 fn decodeBinaryInt(comptime T: type, comptime Src: type, raw: []const u8) !T {
@@ -1902,6 +2504,288 @@ fn decodeBinaryFloat(comptime T: type, comptime Bits: type, comptime FloatT: typ
     if (T != FloatT or raw.len != @sizeOf(Bits)) return error.TypeMismatch;
     const bits = std.mem.readInt(Bits, raw[0..@sizeOf(Bits)], .big);
     return @bitCast(bits);
+}
+
+const ParsedTimeText = struct {
+    time: Time,
+    offset_seconds: ?i32 = null,
+    consumed: usize,
+};
+
+const pg_unix_epoch_days: i64 = daysFromCivil(2000, 1, 1);
+const pg_unix_epoch_micros: i64 = pg_unix_epoch_days * std.time.us_per_day;
+
+fn parseDateText(raw: []const u8) !Date {
+    var index: usize = 0;
+    const year = try parseSignedIntComponent(i32, raw, &index);
+    try expectSeparator(raw, &index, '-');
+    const month = try parseFixedWidthUnsigned(u8, raw, &index, 2);
+    try expectSeparator(raw, &index, '-');
+    const day = try parseFixedWidthUnsigned(u8, raw, &index, 2);
+    if (index != raw.len) return error.BadValue;
+    validateDate(year, month, day) catch return error.BadValue;
+    return .{
+        .year = year,
+        .month = month,
+        .day = day,
+    };
+}
+
+fn parseTimeText(raw: []const u8) !ParsedTimeText {
+    var index: usize = 0;
+    const hour = try parseFixedWidthUnsigned(u8, raw, &index, 2);
+    try expectSeparator(raw, &index, ':');
+    const minute = try parseFixedWidthUnsigned(u8, raw, &index, 2);
+    try expectSeparator(raw, &index, ':');
+    const second = try parseFixedWidthUnsigned(u8, raw, &index, 2);
+    var microsecond: u32 = 0;
+    if (index < raw.len and raw[index] == '.') {
+        index += 1;
+        microsecond = try parseFractionMicros(raw, &index);
+    }
+    validateTime(hour, minute, second) catch return error.BadValue;
+    const offset_seconds = if (index < raw.len) try parseOffsetSeconds(raw, &index) else null;
+    return .{
+        .time = .{
+            .hour = hour,
+            .minute = minute,
+            .second = second,
+            .microsecond = microsecond,
+        },
+        .offset_seconds = offset_seconds,
+        .consumed = index,
+    };
+}
+
+fn parseTimestampText(raw: []const u8) !Timestamp {
+    var index: usize = 0;
+    const year = try parseSignedIntComponent(i32, raw, &index);
+    try expectSeparator(raw, &index, '-');
+    const month = try parseFixedWidthUnsigned(u8, raw, &index, 2);
+    try expectSeparator(raw, &index, '-');
+    const day = try parseFixedWidthUnsigned(u8, raw, &index, 2);
+    if (index >= raw.len or (raw[index] != ' ' and raw[index] != 'T')) return error.BadValue;
+    index += 1;
+
+    const parsed_time = try parseTimeText(raw[index..]);
+    if (index + parsed_time.consumed != raw.len) return error.BadValue;
+    validateDate(year, month, day) catch return error.BadValue;
+
+    var timestamp = Timestamp{
+        .date = .{
+            .year = year,
+            .month = month,
+            .day = day,
+        },
+        .time = parsed_time.time,
+    };
+    if (parsed_time.offset_seconds) |offset| {
+        timestamp = try timestampWithOffsetToUtc(timestamp, offset);
+    }
+    return timestamp;
+}
+
+fn decodeBinaryUuid(raw: []const u8) ![16]u8 {
+    if (raw.len != 16) return error.InvalidBinaryValue;
+    return raw[0..16].*;
+}
+
+fn decodeBinaryDate(raw: []const u8) !Date {
+    if (raw.len != 4) return error.InvalidBinaryValue;
+    const pg_days = std.mem.readInt(i32, raw[0..4], .big);
+    return dateFromUnixDays(@as(i64, pg_days) + pg_unix_epoch_days);
+}
+
+fn decodeBinaryTime(raw: []const u8) !Time {
+    if (raw.len != 8) return error.InvalidBinaryValue;
+    const micros = std.mem.readInt(i64, raw[0..8], .big);
+    if (micros < 0 or micros >= std.time.us_per_day) return error.InvalidBinaryValue;
+    return timeFromDayMicros(micros);
+}
+
+fn decodeBinaryTimestamp(raw: []const u8) !Timestamp {
+    if (raw.len != 8) return error.InvalidBinaryValue;
+    const micros = std.mem.readInt(i64, raw[0..8], .big);
+    return timestampFromUnixMicros(micros + pg_unix_epoch_micros);
+}
+
+fn parseUuidText(raw: []const u8) ![16]u8 {
+    if (raw.len != 36) return error.BadValue;
+    var out: [16]u8 = undefined;
+    var raw_index: usize = 0;
+    var out_index: usize = 0;
+    while (raw_index < raw.len) {
+        if (raw_index == 8 or raw_index == 13 or raw_index == 18 or raw_index == 23) {
+            if (raw[raw_index] != '-') return error.BadValue;
+            raw_index += 1;
+            continue;
+        }
+        out[out_index] = (try parseHexNibble(raw[raw_index]) << 4) | try parseHexNibble(raw[raw_index + 1]);
+        raw_index += 2;
+        out_index += 1;
+    }
+    return out;
+}
+
+fn parseHexNibble(ch: u8) !u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => ch - 'a' + 10,
+        'A'...'F' => ch - 'A' + 10,
+        else => error.BadValue,
+    };
+}
+
+fn parseSignedIntComponent(comptime T: type, raw: []const u8, index: *usize) !T {
+    const start = index.*;
+    if (index.* < raw.len and (raw[index.*] == '-' or raw[index.*] == '+')) index.* += 1;
+    const digit_start = index.*;
+    while (index.* < raw.len and std.ascii.isDigit(raw[index.*])) : (index.* += 1) {}
+    if (digit_start == index.*) return error.BadValue;
+    return std.fmt.parseInt(T, raw[start..index.*], 10) catch error.BadValue;
+}
+
+fn parseFixedWidthUnsigned(comptime T: type, raw: []const u8, index: *usize, width: usize) !T {
+    if (raw.len - index.* < width) return error.BadValue;
+    for (raw[index.* .. index.* + width]) |ch| {
+        if (!std.ascii.isDigit(ch)) return error.BadValue;
+    }
+    const value = std.fmt.parseInt(T, raw[index.* .. index.* + width], 10) catch return error.BadValue;
+    index.* += width;
+    return value;
+}
+
+fn parseFractionMicros(raw: []const u8, index: *usize) !u32 {
+    var micros: u32 = 0;
+    var digits: usize = 0;
+    while (index.* < raw.len and std.ascii.isDigit(raw[index.*])) : (index.* += 1) {
+        if (digits < 6) micros = micros * 10 + (raw[index.*] - '0');
+        digits += 1;
+    }
+    if (digits == 0) return error.BadValue;
+    if (digits < 6) {
+        var remaining = 6 - digits;
+        while (remaining != 0) : (remaining -= 1) micros *= 10;
+    }
+    return micros;
+}
+
+fn parseOffsetSeconds(raw: []const u8, index: *usize) !?i32 {
+    if (index.* >= raw.len) return null;
+    if (raw[index.*] == 'Z') {
+        index.* += 1;
+        return 0;
+    }
+    if (raw[index.*] != '+' and raw[index.*] != '-') return null;
+    const sign: i32 = if (raw[index.*] == '-') -1 else 1;
+    index.* += 1;
+    const hours = try parseFixedWidthUnsigned(i32, raw, index, 2);
+    var minutes: i32 = 0;
+    var seconds: i32 = 0;
+    if (index.* < raw.len and raw[index.*] == ':') {
+        index.* += 1;
+        minutes = try parseFixedWidthUnsigned(i32, raw, index, 2);
+        if (index.* < raw.len and raw[index.*] == ':') {
+            index.* += 1;
+            seconds = try parseFixedWidthUnsigned(i32, raw, index, 2);
+        }
+    } else if (raw.len - index.* >= 2 and std.ascii.isDigit(raw[index.*]) and std.ascii.isDigit(raw[index.* + 1])) {
+        minutes = try parseFixedWidthUnsigned(i32, raw, index, 2);
+    }
+    if (minutes >= 60 or seconds >= 60) return error.BadValue;
+    return sign * (hours * 3600 + minutes * 60 + seconds);
+}
+
+fn expectSeparator(raw: []const u8, index: *usize, separator: u8) !void {
+    if (index.* >= raw.len or raw[index.*] != separator) return error.BadValue;
+    index.* += 1;
+}
+
+fn validateDate(year: i32, month: u8, day: u8) !void {
+    if (month < 1 or month > 12 or day < 1) return error.BadValue;
+    const days_in_month: u8 = switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) @as(u8, 29) else @as(u8, 28),
+        else => unreachable,
+    };
+    if (day > days_in_month) return error.BadValue;
+}
+
+fn validateTime(hour: u8, minute: u8, second: u8) !void {
+    if (hour > 23 or minute > 59 or second > 59) return error.BadValue;
+}
+
+fn isLeapYear(year: i32) bool {
+    if (@mod(year, 4) != 0) return false;
+    if (@mod(year, 100) != 0) return true;
+    return @mod(year, 400) == 0;
+}
+
+fn daysFromCivil(year: i32, month: u8, day: u8) i64 {
+    const y = @as(i64, year) - @as(i64, if (month <= 2) 1 else 0);
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const m = @as(i64, month);
+    const mp = m + (if (m > 2) @as(i64, -3) else @as(i64, 9));
+    const doy = @divFloor(153 * mp + 2, 5) + @as(i64, day) - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn dateFromUnixDays(days: i64) Date {
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    var year = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const day = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const month = mp + (if (mp < 10) @as(i64, 3) else @as(i64, -9));
+    year += if (month <= 2) 1 else 0;
+    return .{
+        .year = @intCast(year),
+        .month = @intCast(month),
+        .day = @intCast(day),
+    };
+}
+
+fn timeFromDayMicros(day_micros: i64) Time {
+    const hour = @divFloor(day_micros, std.time.us_per_hour);
+    const minute = @divFloor(@mod(day_micros, std.time.us_per_hour), std.time.us_per_min);
+    const second = @divFloor(@mod(day_micros, std.time.us_per_min), std.time.us_per_s);
+    const microsecond = @mod(day_micros, std.time.us_per_s);
+    return .{
+        .hour = @intCast(hour),
+        .minute = @intCast(minute),
+        .second = @intCast(second),
+        .microsecond = @intCast(microsecond),
+    };
+}
+
+fn timestampFromUnixMicros(unix_micros: i64) !Timestamp {
+    const unix_days = @divFloor(unix_micros, std.time.us_per_day);
+    const day_micros = @mod(unix_micros, std.time.us_per_day);
+    return .{
+        .date = dateFromUnixDays(unix_days),
+        .time = timeFromDayMicros(day_micros),
+    };
+}
+
+fn timestampWithOffsetToUtc(timestamp: Timestamp, offset_seconds: i32) !Timestamp {
+    const unix_micros = unixMicrosFromTimestamp(timestamp) - @as(i64, offset_seconds) * std.time.us_per_s;
+    return timestampFromUnixMicros(unix_micros);
+}
+
+fn unixMicrosFromTimestamp(timestamp: Timestamp) i64 {
+    const unix_days = daysFromCivil(timestamp.date.year, timestamp.date.month, timestamp.date.day);
+    const day_micros =
+        @as(i64, timestamp.time.hour) * std.time.us_per_hour +
+        @as(i64, timestamp.time.minute) * std.time.us_per_min +
+        @as(i64, timestamp.time.second) * std.time.us_per_s +
+        @as(i64, timestamp.time.microsecond);
+    return unix_days * std.time.us_per_day + day_micros;
 }
 
 test "parse row description rejects truncated payload" {
@@ -1924,11 +2808,57 @@ test "binary decode supports common scalar types" {
     try std.testing.expectEqual(true, try decodeBinaryValue(bool, 16, &.{1}));
 }
 
+test "binary decode supports uuid date time timestamp and jsonb" {
+    try std.testing.expectEqualSlices(u8, &.{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    }, &(try decodeBinaryValue([16]u8, 2950, &.{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    })));
+
+    var date_bytes: [4]u8 = undefined;
+    std.mem.writeInt(i32, &date_bytes, @intCast(daysFromCivil(2026, 3, 18) - pg_unix_epoch_days), .big);
+    try std.testing.expectEqual(Date{ .year = 2026, .month = 3, .day = 18 }, try decodeBinaryValue(Date, 1082, &date_bytes));
+
+    var time_bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &time_bytes, 12 * std.time.us_per_hour + 34 * std.time.us_per_min + 56 * std.time.us_per_s + 789012, .big);
+    try std.testing.expectEqual(Time{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 }, try decodeBinaryValue(Time, 1083, &time_bytes));
+
+    const ts = Timestamp{
+        .date = .{ .year = 2026, .month = 3, .day = 18 },
+        .time = .{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 },
+    };
+    var ts_bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &ts_bytes, unixMicrosFromTimestamp(ts) - pg_unix_epoch_micros, .big);
+    try std.testing.expectEqual(ts, try decodeBinaryValue(Timestamp, 1114, &ts_bytes));
+
+    try std.testing.expectEqualStrings("{\"a\":1}", try decodeBinaryValue([]const u8, 3802, &.{ 1, '{', '"', 'a', '"', ':', '1', '}' }));
+}
+
 test "text decode supports bool int float and bytes" {
     try std.testing.expectEqual(@as(i32, 42), try decodeTextValue(i32, "42"));
     try std.testing.expectEqual(true, try decodeTextValue(bool, "t"));
     try std.testing.expectApproxEqAbs(@as(f64, 1.25), try decodeTextValue(f64, "1.25"), 0.000001);
     try std.testing.expectEqualStrings("hello", try decodeTextValue([]const u8, "hello"));
+}
+
+test "text decode supports uuid date time and timestamp types" {
+    try std.testing.expectEqualSlices(u8, &.{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    }, &(try decodeTextValue([16]u8, "550e8400-e29b-41d4-a716-446655440000")));
+
+    try std.testing.expectEqual(Date{ .year = 2026, .month = 3, .day = 18 }, try decodeTextValue(Date, "2026-03-18"));
+    try std.testing.expectEqual(Time{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 }, try decodeTextValue(Time, "12:34:56.789012"));
+    try std.testing.expectEqual(Timestamp{
+        .date = .{ .year = 2026, .month = 3, .day = 18 },
+        .time = .{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 },
+    }, try decodeTextValue(Timestamp, "2026-03-18 12:34:56.789012"));
+    try std.testing.expectEqual(Timestamp{
+        .date = .{ .year = 2026, .month = 3, .day = 18 },
+        .time = .{ .hour = 7, .minute = 4, .second = 56, .microsecond = 789012 },
+    }, try decodeTextValue(Timestamp, "2026-03-18 12:34:56.789012+05:30"));
 }
 
 test "encode values covers text and binary params" {
@@ -2122,6 +3052,8 @@ test "queue pipeline simple query appends statements" {
     conn.allocator = std.testing.allocator;
     conn.queued_simple_pipeline_sql = .empty;
     conn.last_error = null;
+    conn.unnamed_statement_sql = &.{};
+    conn.unnamed_statement_param_types = &.{};
     defer {
         conn.queued_simple_pipeline_sql.deinit(std.testing.allocator);
     }
@@ -2131,6 +3063,23 @@ test "queue pipeline simple query appends statements" {
 
     try conn.queuePipelineSimpleQuery("select 2");
     try std.testing.expectEqualStrings("select 1;select 2;", conn.queued_simple_pipeline_sql.items);
+}
+
+test "simple query paths clear unnamed statement cache" {
+    var conn: Conn = undefined;
+    conn.allocator = std.testing.allocator;
+    conn.last_error = null;
+    conn.unnamed_statement_sql = try std.testing.allocator.dupe(u8, "select $1");
+    conn.unnamed_statement_param_types = try std.testing.allocator.dupe(u32, &.{23});
+    conn.queued_simple_pipeline_sql = .empty;
+    defer {
+        conn.clearUnnamedStatementCache();
+        conn.queued_simple_pipeline_sql.deinit(std.testing.allocator);
+    }
+
+    try conn.queuePipelineSimpleQuery("select 1");
+    try std.testing.expectEqual(@as(usize, 0), conn.unnamed_statement_sql.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.unnamed_statement_param_types.len);
 }
 
 test "parse data row rejects negative non null length" {
@@ -2186,6 +3135,51 @@ test "message length helpers match encoded wire sizes" {
     try proto.appendExecute(&out, std.testing.allocator, "", 0);
     try proto.appendSync(&out, std.testing.allocator);
     try std.testing.expectEqual(extendedQueryMessageLen("stmt", "select $1, $2", &params, true), out.items.len);
+}
+
+test "direct value bind encodes binary scalars without text formatting" {
+    const values = [_]Value{
+        .{ .int4 = 7 },
+        .{ .text = "hi" },
+        .{ .float8 = 1.25 },
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try out.ensureUnusedCapacity(std.testing.allocator, try valueBindMessageLen("p0", "s0", &values));
+    try appendBindValuesAssumeCapacity(&out, "p0", "s0", &values, .text);
+
+    try std.testing.expectEqual(@as(u8, 'B'), out.items[0]);
+
+    var index: usize = 5;
+    try std.testing.expectEqualStrings("p0", try proto.fieldCString(out.items, &index));
+    try std.testing.expectEqualStrings("s0", try proto.fieldCString(out.items, &index));
+    try std.testing.expectEqual(@as(u16, 3), try readIntAt(u16, out.items, &index));
+    index += 2;
+    try std.testing.expectEqual(@intFromEnum(proto.FormatCode.binary), try readIntAt(u16, out.items, &index));
+    index += 2;
+    try std.testing.expectEqual(@intFromEnum(proto.FormatCode.text), try readIntAt(u16, out.items, &index));
+    index += 2;
+    try std.testing.expectEqual(@intFromEnum(proto.FormatCode.binary), try readIntAt(u16, out.items, &index));
+    index += 2;
+    try std.testing.expectEqual(@as(u16, 3), try readIntAt(u16, out.items, &index));
+    index += 2;
+
+    try std.testing.expectEqual(@as(i32, 4), try readIntAt(i32, out.items, &index));
+    index += 4;
+    var value_index: usize = 0;
+    try std.testing.expectEqual(@as(i32, 7), try readIntAt(i32, out.items[index .. index + 4], &value_index));
+    index += 4;
+
+    try std.testing.expectEqual(@as(i32, 2), try readIntAt(i32, out.items, &index));
+    index += 4;
+    try std.testing.expectEqualStrings("hi", out.items[index .. index + 2]);
+    index += 2;
+
+    try std.testing.expectEqual(@as(i32, 8), try readIntAt(i32, out.items, &index));
+    index += 4;
+    value_index = 0;
+    try std.testing.expectEqual(@as(f64, 1.25), @as(f64, @bitCast(try readIntAt(u64, out.items[index .. index + 8], &value_index))));
 }
 
 test "pipeline statement cache keys include parameter types" {

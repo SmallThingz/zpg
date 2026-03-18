@@ -14,6 +14,7 @@
 //! - `conn.queryValues(...)`, `conn.execValues(...)`, and `conn.prepare(...)` expose the extended protocol
 //! - `conn.pipeline(...)` exposes pipelined simple or extended execution on one connection
 //! - `zpg.CompiledQuery(...)` fixes SQL shape, protocol selection, parameter typing, and typed row decoding at comptime
+//! - `zpg.Date`, `zpg.Time`, and `zpg.Timestamp` decode common PostgreSQL temporal types
 //!
 //! ## Supported today
 //!
@@ -26,6 +27,7 @@
 //! - parameterized pipelining on a single connection
 //! - fixed-size lazy connection pool
 //! - text and binary result decoding
+//! - typed decoding for UUID, date, time, timestamp, and timestamptz values
 //!
 //! ## Current tradeoffs
 //!
@@ -54,6 +56,9 @@ pub const Column = @import("conn.zig").Column;
 pub const Value = @import("conn.zig").Value;
 pub const QueryOptions = @import("conn.zig").QueryOptions;
 pub const QueryProtocol = @import("conn.zig").QueryProtocol;
+pub const Date = @import("conn.zig").Date;
+pub const Time = @import("conn.zig").Time;
+pub const Timestamp = @import("conn.zig").Timestamp;
 pub const CompiledQuery = @import("conn.zig").CompiledQuery;
 pub const CompiledResult = @import("conn.zig").CompiledResult;
 pub const Pipeline = @import("conn.zig").Pipeline;

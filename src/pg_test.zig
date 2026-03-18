@@ -165,6 +165,40 @@ test "pool query against local postgres" {
     try std.testing.expectEqualStrings("direct", direct_param.rows[0].get(0).?);
     try std.testing.expectEqualStrings("17", direct_param.rows[0].get(1).?);
 
+    const type_conn = try zpg.Conn.connect(std.testing.allocator, std.testing.io, &cfg);
+    defer type_conn.destroy();
+    const type_tz_tag = try type_conn.exec(std.testing.allocator, "set time zone 'UTC'");
+    defer std.testing.allocator.free(type_tz_tag);
+
+    var text_types = try type_conn.query(std.testing.allocator,
+        \\select
+        \\  '550e8400-e29b-41d4-a716-446655440000'::uuid as uuid_v,
+        \\  date '2026-03-18' as d,
+        \\  time '12:34:56.789012' as t,
+        \\  timestamp '2026-03-18 12:34:56.789012' as ts,
+        \\  timestamptz '2026-03-18 12:34:56.789012+05:30' as tstz,
+        \\  '{"kind":"json"}'::json as j,
+        \\  '{"kind":"jsonb"}'::jsonb as jb
+    );
+    defer text_types.deinit();
+    try std.testing.expectEqual(@as(usize, 7), text_types.rows[0].values.len);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    }, &(try text_types.decode(0, 0, [16]u8)).?);
+    try std.testing.expectEqual(zpg.Date{ .year = 2026, .month = 3, .day = 18 }, (try text_types.decode(0, 1, zpg.Date)).?);
+    try std.testing.expectEqual(zpg.Time{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 }, (try text_types.decode(0, 2, zpg.Time)).?);
+    try std.testing.expectEqual(zpg.Timestamp{
+        .date = .{ .year = 2026, .month = 3, .day = 18 },
+        .time = .{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 },
+    }, (try text_types.decode(0, 3, zpg.Timestamp)).?);
+    try std.testing.expectEqual(zpg.Timestamp{
+        .date = .{ .year = 2026, .month = 3, .day = 18 },
+        .time = .{ .hour = 7, .minute = 4, .second = 56, .microsecond = 789012 },
+    }, (try text_types.decode(0, 4, zpg.Timestamp)).?);
+    try std.testing.expectEqualStrings("{\"kind\":\"json\"}", (try text_types.decode(0, 5, []const u8)).?);
+    try std.testing.expectEqualStrings("{\"kind\": \"jsonb\"}", (try text_types.decode(0, 6, []const u8)).?);
+
     const StaticParamQuery = zpg.CompiledQuery(
         "select $1::text as status, $2::int4 as n",
         struct { []const u8, i32 },
@@ -198,6 +232,33 @@ test "pool query against local postgres" {
     defer cp2.deinit();
     try std.testing.expectEqualStrings("compiled-pipe-2", cp2.rows[0].status);
     try std.testing.expectEqual(@as(i32, 41), cp2.rows[0].n);
+
+    const TemporalParamQuery = zpg.CompiledQuery(
+        "select $1::uuid as uuid_v, $2::date as d, $3::time as t, $4::timestamp as ts",
+        struct { [16]u8, zpg.Date, zpg.Time, zpg.Timestamp },
+        struct {
+            uuid_v: [16]u8,
+            d: zpg.Date,
+            t: zpg.Time,
+            ts: zpg.Timestamp,
+        },
+    );
+    const uuid_v = [16]u8{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    };
+    const date_v = zpg.Date{ .year = 2026, .month = 3, .day = 18 };
+    const time_v = zpg.Time{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 };
+    const ts_v = zpg.Timestamp{
+        .date = .{ .year = 2026, .month = 3, .day = 18 },
+        .time = .{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 },
+    };
+    var temporal = try TemporalParamQuery.query(conn, std.testing.allocator, .{ uuid_v, date_v, time_v, ts_v });
+    defer temporal.deinit();
+    try std.testing.expectEqualSlices(u8, &uuid_v, &temporal.rows[0].uuid_v);
+    try std.testing.expectEqual(date_v, temporal.rows[0].d);
+    try std.testing.expectEqual(time_v, temporal.rows[0].t);
+    try std.testing.expectEqual(ts_v, temporal.rows[0].ts);
 }
 
 test "tls query against docker postgres" {

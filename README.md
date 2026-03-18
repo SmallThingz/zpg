@@ -43,6 +43,7 @@ Requirements for benchmarking:
 - `conn.execValues(...)` / `pool.execValues(...)`
 - `conn.prepare(...)`
 - `conn.pipeline(...)`
+- `zpg.Date`, `zpg.Time`, `zpg.Timestamp`
 
 ## Current features
 
@@ -54,6 +55,7 @@ Requirements for benchmarking:
 - pipelined simple and extended query execution on one connection
 - fixed-size lazy connection pool
 - text and binary result decoding
+- typed decode coverage for UUID plus common temporal types (`date`, `time`, `timestamp`, `timestamptz`)
 - pool only reuses connections that are healthy and back in idle transaction state
 
 ## Current tradeoffs
