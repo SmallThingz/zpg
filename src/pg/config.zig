@@ -1,12 +1,22 @@
 const std = @import("std");
 
 pub const Config = struct {
+    pub const SslMode = enum {
+        disable,
+        prefer,
+        require,
+        verify_ca,
+        verify_full,
+    };
+
     host: []u8,
     port: u16,
     user: []u8,
     password: ?[]u8,
     database: []u8,
     application_name: []u8,
+    ssl_mode: SslMode,
+    ssl_root_cert: ?[]u8,
     connect_timeout_ms: u32,
     max_message_len: u32,
 
@@ -32,7 +42,8 @@ pub const Config = struct {
         var connect_timeout_ms: u32 = 5_000;
         var application_name: []const u8 = "zpg";
         var max_message_len: u32 = 16 * 1024 * 1024;
-        var sslmode: ?[]const u8 = null;
+        var ssl_mode: SslMode = .prefer;
+        var ssl_root_cert: ?[]const u8 = null;
         if (uri.query) |query| {
             const raw_query = try query.toRawMaybeAlloc(temp);
             var it = std.mem.splitScalar(u8, raw_query, '&');
@@ -48,12 +59,11 @@ pub const Config = struct {
                 } else if (std.mem.eql(u8, key, "max_message_len") and value.len != 0) {
                     max_message_len = std.fmt.parseInt(u32, value, 10) catch max_message_len;
                 } else if (std.mem.eql(u8, key, "sslmode")) {
-                    sslmode = value;
+                    ssl_mode = parseSslMode(value) orelse return error.InvalidSslMode;
+                } else if (std.mem.eql(u8, key, "sslrootcert") and value.len != 0) {
+                    ssl_root_cert = value;
                 }
             }
-        }
-        if (sslmode) |mode| {
-            if (!std.mem.eql(u8, mode, "disable")) return error.TlsUnsupported;
         }
         return .{
             .host = try allocator.dupe(u8, host_name.bytes),
@@ -62,6 +72,8 @@ pub const Config = struct {
             .password = if (password_raw) |value| try allocator.dupe(u8, value) else null,
             .database = try allocator.dupe(u8, database_raw),
             .application_name = try allocator.dupe(u8, application_name),
+            .ssl_mode = ssl_mode,
+            .ssl_root_cert = if (ssl_root_cert) |path| try allocator.dupe(u8, path) else null,
             .connect_timeout_ms = connect_timeout_ms,
             .max_message_len = max_message_len,
         };
@@ -73,9 +85,19 @@ pub const Config = struct {
         if (config.password) |password| allocator.free(password);
         allocator.free(config.database);
         allocator.free(config.application_name);
+        if (config.ssl_root_cert) |path| allocator.free(path);
         config.* = undefined;
     }
 };
+
+fn parseSslMode(value: []const u8) ?Config.SslMode {
+    if (std.mem.eql(u8, value, "disable")) return .disable;
+    if (std.mem.eql(u8, value, "prefer")) return .prefer;
+    if (std.mem.eql(u8, value, "require")) return .require;
+    if (std.mem.eql(u8, value, "verify-ca")) return .verify_ca;
+    if (std.mem.eql(u8, value, "verify-full")) return .verify_full;
+    return null;
+}
 
 test "parse postgres uri" {
     var cfg = try Config.parseUri(std.testing.allocator, "postgres://user:pass@localhost:5544/dbname?application_name=tester&connect_timeout=9");
@@ -87,6 +109,7 @@ test "parse postgres uri" {
     try std.testing.expectEqualStrings("pass", cfg.password.?);
     try std.testing.expectEqualStrings("dbname", cfg.database);
     try std.testing.expectEqualStrings("tester", cfg.application_name);
+    try std.testing.expectEqual(Config.SslMode.prefer, cfg.ssl_mode);
     try std.testing.expectEqual(@as(u32, 9000), cfg.connect_timeout_ms);
 }
 
@@ -107,6 +130,14 @@ test "parse postgres uri root path falls back to user database" {
     try std.testing.expectEqualStrings("alice", cfg.database);
 }
 
-test "parse postgres uri rejects tls modes" {
-    try std.testing.expectError(error.TlsUnsupported, Config.parseUri(std.testing.allocator, "postgres://alice@localhost/db?sslmode=prefer"));
+test "parse postgres uri accepts ssl modes" {
+    var cfg = try Config.parseUri(std.testing.allocator, "postgres://alice@localhost/db?sslmode=verify-full&sslrootcert=%2Ftmp%2Fca.pem");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Config.SslMode.verify_full, cfg.ssl_mode);
+    try std.testing.expectEqualStrings("/tmp/ca.pem", cfg.ssl_root_cert.?);
+}
+
+test "parse postgres uri rejects invalid ssl mode" {
+    try std.testing.expectError(error.InvalidSslMode, Config.parseUri(std.testing.allocator, "postgres://alice@localhost/db?sslmode=allow"));
 }

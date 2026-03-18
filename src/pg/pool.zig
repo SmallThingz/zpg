@@ -2,6 +2,8 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 const Conn = @import("conn.zig").Conn;
 const Result = @import("conn.zig").Result;
+const QueryOptions = @import("conn.zig").QueryOptions;
+const Value = @import("conn.zig").Value;
 
 pub const Stats = struct {
     max_size: usize,
@@ -108,10 +110,34 @@ pub const Pool = struct {
         return pool.queryAlloc(allocator, sql);
     }
 
+    pub fn queryOpts(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, opts: QueryOptions) !Result {
+        const conn = try pool.acquire();
+        defer pool.release(conn);
+        return conn.queryOpts(allocator, sql, opts);
+    }
+
+    pub fn queryValues(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) !Result {
+        const conn = try pool.acquire();
+        defer pool.release(conn);
+        return conn.queryValues(allocator, sql, values, opts);
+    }
+
     pub fn exec(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
         const conn = try pool.acquire();
         defer pool.release(conn);
         return conn.exec(allocator, sql);
+    }
+
+    pub fn execOpts(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, opts: QueryOptions) ![]const u8 {
+        const conn = try pool.acquire();
+        defer pool.release(conn);
+        return conn.execOpts(allocator, sql, opts);
+    }
+
+    pub fn execValues(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) ![]const u8 {
+        const conn = try pool.acquire();
+        defer pool.release(conn);
+        return conn.execValues(allocator, sql, values, opts);
     }
 
     pub fn stats(pool: *Pool) Stats {
@@ -138,6 +164,8 @@ test "pool reuse guard rejects transaction states" {
         .password = null,
         .database = try std.testing.allocator.dupe(u8, "d"),
         .application_name = try std.testing.allocator.dupe(u8, "a"),
+        .ssl_mode = .disable,
+        .ssl_root_cert = null,
         .connect_timeout_ms = 0,
         .max_message_len = 1024,
     }, 1);

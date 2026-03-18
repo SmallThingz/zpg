@@ -10,7 +10,7 @@
         "build.zig.zon",
         "benchmark",
         "examples",
+        "scripts",
         "src",
-        "test_runner.zig",
     },
 }

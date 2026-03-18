@@ -15,6 +15,27 @@ pub const MessageView = struct {
     payload: []u8,
 };
 
+pub const FormatCode = enum(u16) {
+    text = 0,
+    binary = 1,
+};
+
+pub const DescribeTarget = enum(u8) {
+    statement = 'S',
+    portal = 'P',
+};
+
+pub const CloseTarget = enum(u8) {
+    statement = 'S',
+    portal = 'P',
+};
+
+pub const Param = struct {
+    type_oid: u32 = 0,
+    format: FormatCode = .text,
+    value: ?[]const u8 = null,
+};
+
 pub const ErrorResponse = struct {
     severity: []u8 = &.{},
     code: []u8 = &.{},
@@ -52,82 +73,161 @@ pub fn readMessageInto(allocator: std.mem.Allocator, reader: *std.Io.Reader, max
 }
 
 pub fn writeStartup(writer: *std.Io.Writer, user: []const u8, database: []const u8, application_name: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    try appendStartup(&buf, std.heap.page_allocator, user, database, application_name);
+    try writer.writeAll(buf.items);
+    try writer.flush();
+}
+
+pub fn appendSslRequest(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try appendInt(out, allocator, u32, 8);
+    try appendInt(out, allocator, u32, 80877103);
+}
+
+pub fn writeQuery(writer: *std.Io.Writer, sql: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    try appendQuery(&buf, std.heap.page_allocator, sql);
+    try writer.writeAll(buf.items);
+    try writer.flush();
+}
+
+pub fn writePassword(writer: *std.Io.Writer, password: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    try appendPasswordMessage(&buf, std.heap.page_allocator, password);
+    try writer.writeAll(buf.items);
+    try writer.flush();
+}
+
+pub fn writeSaslInitialResponse(writer: *std.Io.Writer, mechanism: []const u8, response: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    try appendSaslInitialResponse(&buf, std.heap.page_allocator, mechanism, response);
+    try writer.writeAll(buf.items);
+    try writer.flush();
+}
+
+pub fn writeSaslResponse(writer: *std.Io.Writer, response: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    try appendSaslResponse(&buf, std.heap.page_allocator, response);
+    try writer.writeAll(buf.items);
+    try writer.flush();
+}
+
+pub fn writeTerminate(writer: *std.Io.Writer) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    try appendTerminate(&buf, std.heap.page_allocator);
+    try writer.writeAll(buf.items);
+    try writer.flush();
+}
+
+pub fn appendStartup(out: *std.ArrayList(u8), allocator: std.mem.Allocator, user: []const u8, database: []const u8, application_name: []const u8) !void {
     const payload_len = 4 +
         ("user".len + 1 + user.len + 1) +
         ("database".len + 1 + database.len + 1) +
         ("application_name".len + 1 + application_name.len + 1) +
         ("client_encoding".len + 1 + "UTF8".len + 1) +
         1;
-    var header: [8]u8 = undefined;
-    std.mem.writeInt(u32, header[0..4], @as(u32, @intCast(payload_len + 4)), .big);
-    std.mem.writeInt(u32, header[4..8], 196608, .big);
-    var vec = [_][]const u8{
-        header[0..],
-        "user",
-        &.{0},
-        user,
-        &.{0},
-        "database",
-        &.{0},
-        database,
-        &.{0},
-        "application_name",
-        &.{0},
-        application_name,
-        &.{0},
-        "client_encoding",
-        &.{0},
-        "UTF8",
-        &.{0},
-        &.{0},
-    };
-    try writer.writeVecAll(&vec);
-    try writer.flush();
+    try appendInt(out, allocator, u32, @as(u32, @intCast(payload_len + 4)));
+    try appendInt(out, allocator, u32, 196608);
+    try appendCString(out, allocator, "user");
+    try appendCString(out, allocator, user);
+    try appendCString(out, allocator, "database");
+    try appendCString(out, allocator, database);
+    try appendCString(out, allocator, "application_name");
+    try appendCString(out, allocator, application_name);
+    try appendCString(out, allocator, "client_encoding");
+    try appendCString(out, allocator, "UTF8");
+    try out.append(allocator, 0);
 }
 
-pub fn writeQuery(writer: *std.Io.Writer, sql: []const u8) !void {
-    var header: [5]u8 = undefined;
-    header[0] = 'Q';
-    std.mem.writeInt(u32, header[1..5], @as(u32, @intCast(sql.len + 5)), .big);
-    var vec = [_][]const u8{ header[0..], sql, &.{0} };
-    try writer.writeVecAll(&vec);
-    try writer.flush();
+pub fn appendQuery(out: *std.ArrayList(u8), allocator: std.mem.Allocator, sql: []const u8) !void {
+    try appendTaggedHeader(out, allocator, 'Q', sql.len + 1);
+    try appendCString(out, allocator, sql);
 }
 
-pub fn writePassword(writer: *std.Io.Writer, password: []const u8) !void {
-    var header: [5]u8 = undefined;
-    header[0] = 'p';
-    std.mem.writeInt(u32, header[1..5], @as(u32, @intCast(password.len + 5)), .big);
-    var vec = [_][]const u8{ header[0..], password, &.{0} };
-    try writer.writeVecAll(&vec);
-    try writer.flush();
+pub fn appendPasswordMessage(out: *std.ArrayList(u8), allocator: std.mem.Allocator, password: []const u8) !void {
+    try appendTaggedHeader(out, allocator, 'p', password.len + 1);
+    try appendCString(out, allocator, password);
 }
 
-pub fn writeSaslInitialResponse(writer: *std.Io.Writer, mechanism: []const u8, response: []const u8) !void {
-    var header: [5]u8 = undefined;
-    const len = mechanism.len + 1 + 4 + response.len + 4;
-    header[0] = 'p';
-    std.mem.writeInt(u32, header[1..5], @as(u32, @intCast(len)), .big);
-    var resp_len: [4]u8 = undefined;
-    std.mem.writeInt(u32, &resp_len, @as(u32, @intCast(response.len)), .big);
-    var vec = [_][]const u8{ header[0..], mechanism, &.{0}, resp_len[0..], response };
-    try writer.writeVecAll(&vec);
-    try writer.flush();
+pub fn appendSaslInitialResponse(out: *std.ArrayList(u8), allocator: std.mem.Allocator, mechanism: []const u8, response: []const u8) !void {
+    try appendTaggedHeader(out, allocator, 'p', mechanism.len + 1 + 4 + response.len);
+    try appendCString(out, allocator, mechanism);
+    try appendInt(out, allocator, u32, @as(u32, @intCast(response.len)));
+    try out.appendSlice(allocator, response);
 }
 
-pub fn writeSaslResponse(writer: *std.Io.Writer, response: []const u8) !void {
-    var header: [5]u8 = undefined;
-    header[0] = 'p';
-    std.mem.writeInt(u32, header[1..5], @as(u32, @intCast(response.len + 4)), .big);
-    var vec = [_][]const u8{ header[0..], response };
-    try writer.writeVecAll(&vec);
-    try writer.flush();
+pub fn appendSaslResponse(out: *std.ArrayList(u8), allocator: std.mem.Allocator, response: []const u8) !void {
+    try appendTaggedHeader(out, allocator, 'p', response.len);
+    try out.appendSlice(allocator, response);
 }
 
-pub fn writeTerminate(writer: *std.Io.Writer) !void {
-    var header: [5]u8 = .{ 'X', 0, 0, 0, 4 };
-    try writer.writeAll(&header);
-    try writer.flush();
+pub fn appendParse(out: *std.ArrayList(u8), allocator: std.mem.Allocator, statement_name: []const u8, sql: []const u8, param_types: []const u32) !void {
+    const payload_len = statement_name.len + 1 + sql.len + 1 + 2 + (4 * param_types.len);
+    try appendTaggedHeader(out, allocator, 'P', payload_len);
+    try appendCString(out, allocator, statement_name);
+    try appendCString(out, allocator, sql);
+    try appendInt(out, allocator, u16, @as(u16, @intCast(param_types.len)));
+    for (param_types) |oid| try appendInt(out, allocator, u32, oid);
+}
+
+pub fn appendBind(out: *std.ArrayList(u8), allocator: std.mem.Allocator, portal_name: []const u8, statement_name: []const u8, params: []const Param, result_format: FormatCode) !void {
+    var payload_len: usize = portal_name.len + 1 + statement_name.len + 1;
+    payload_len += 2 + (2 * params.len);
+    payload_len += 2;
+    for (params) |param| {
+        payload_len += 4;
+        if (param.value) |value| payload_len += value.len;
+    }
+    payload_len += 2 + 2;
+
+    try appendTaggedHeader(out, allocator, 'B', payload_len);
+    try appendCString(out, allocator, portal_name);
+    try appendCString(out, allocator, statement_name);
+    try appendInt(out, allocator, u16, @as(u16, @intCast(params.len)));
+    for (params) |param| try appendInt(out, allocator, u16, @intFromEnum(param.format));
+    try appendInt(out, allocator, u16, @as(u16, @intCast(params.len)));
+    for (params) |param| {
+        if (param.value) |value| {
+            try appendInt(out, allocator, i32, @as(i32, @intCast(value.len)));
+            try out.appendSlice(allocator, value);
+        } else {
+            try appendInt(out, allocator, i32, -1);
+        }
+    }
+    try appendInt(out, allocator, u16, 1);
+    try appendInt(out, allocator, u16, @intFromEnum(result_format));
+}
+
+pub fn appendDescribe(out: *std.ArrayList(u8), allocator: std.mem.Allocator, target: DescribeTarget, name: []const u8) !void {
+    try appendTaggedHeader(out, allocator, 'D', 1 + name.len + 1);
+    try out.append(allocator, @intFromEnum(target));
+    try appendCString(out, allocator, name);
+}
+
+pub fn appendExecute(out: *std.ArrayList(u8), allocator: std.mem.Allocator, portal_name: []const u8, max_rows: u32) !void {
+    try appendTaggedHeader(out, allocator, 'E', portal_name.len + 1 + 4);
+    try appendCString(out, allocator, portal_name);
+    try appendInt(out, allocator, u32, max_rows);
+}
+
+pub fn appendSync(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try appendTaggedHeader(out, allocator, 'S', 0);
+}
+
+pub fn appendClose(out: *std.ArrayList(u8), allocator: std.mem.Allocator, target: CloseTarget, name: []const u8) !void {
+    try appendTaggedHeader(out, allocator, 'C', 1 + name.len + 1);
+    try out.append(allocator, @intFromEnum(target));
+    try appendCString(out, allocator, name);
+}
+
+pub fn appendTerminate(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try appendTaggedHeader(out, allocator, 'X', 0);
 }
 
 pub fn decodeAuthentication(payload: []const u8) !Authentication {
@@ -205,6 +305,22 @@ pub fn fieldCString(payload: []const u8, index: *usize) ![]const u8 {
     return value;
 }
 
+fn appendTaggedHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tag: u8, payload_len: usize) !void {
+    try out.append(allocator, tag);
+    try appendInt(out, allocator, u32, @as(u32, @intCast(payload_len + 4)));
+}
+
+fn appendCString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    try out.appendSlice(allocator, text);
+    try out.append(allocator, 0);
+}
+
+fn appendInt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime T: type, value: T) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .big);
+    try out.appendSlice(allocator, &bytes);
+}
+
 test "decode auth sasl" {
     const auth = try decodeAuthentication(&[_]u8{
         0,   0,   0,   10,
@@ -244,6 +360,20 @@ test "parse error response keeps last duplicate field without leaking" {
     });
     defer err.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("two", err.message);
+}
+
+test "append bind encodes null and binary parameters" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendBind(&out, std.testing.allocator, "", "stmt", &.{
+        .{ .format = .text, .value = "abc" },
+        .{ .type_oid = 17, .format = .binary, .value = &.{ 1, 2, 3 } },
+        .{ .type_oid = 23, .format = .text, .value = null },
+    }, .binary);
+
+    try std.testing.expectEqual(@as(u8, 'B'), out.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "stmt") != null);
 }
 
 test "protocol fuzz parsers stay bounded" {

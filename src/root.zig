@@ -9,32 +9,43 @@
 //! - `zpg.Config.parseUri(...)` parses `postgres://...` / `postgresql://...` URLs
 //! - `zpg.Conn.connect(...)` opens one connection
 //! - `zpg.Pool.init(...)` and `zpg.Pool.initUri(...)` create a lazy fixed-size pool
-//! - `conn.query(...)` / `pool.query(...)` run simple-query SQL and return a `zpg.Result`
-//! - `conn.exec(...)` / `pool.exec(...)` run simple-query SQL and return the command tag
+//! - `conn.query(...)` / `pool.query(...)` run SQL and return a `zpg.Result`
+//! - `conn.exec(...)` / `pool.exec(...)` run SQL and return the command tag
+//! - `conn.queryValues(...)`, `conn.execValues(...)`, and `conn.prepare(...)` expose the extended protocol
 //!
 //! ## Supported today
 //!
+//! - PostgreSQL SSL negotiation backed by Zig std TLS
 //! - startup + authentication
 //! - cleartext, MD5, and SCRAM-SHA-256 auth
 //! - simple query protocol
+//! - extended protocol with prepared statements
 //! - fixed-size lazy connection pool
-//! - row/column metadata plus text result values
+//! - text and binary result decoding
 //!
 //! ## Current non-goals
 //!
-//! - TLS
-//! - prepared statements / extended protocol
-//! - binary result decoding
+//! - client certificates
+//!
+//! Zig std currently exposes server-side TLS verification for
+//! `std.crypto.tls.Client`, but not a public API for supplying a client
+//! certificate/private key pair, so mTLS client auth is not implemented yet.
 const std = @import("std");
 
 pub const Config = @import("pg/config.zig").Config;
+pub const SslMode = Config.SslMode;
 pub const Conn = @import("pg/conn.zig").Conn;
 pub const Result = @import("pg/conn.zig").Result;
 pub const Row = @import("pg/conn.zig").Row;
 pub const Column = @import("pg/conn.zig").Column;
+pub const Value = @import("pg/conn.zig").Value;
+pub const QueryOptions = @import("pg/conn.zig").QueryOptions;
+pub const QueryProtocol = @import("pg/conn.zig").QueryProtocol;
+pub const Statement = @import("pg/conn.zig").Statement;
 pub const Pool = @import("pg/pool.zig").Pool;
 pub const Stats = @import("pg/pool.zig").Stats;
 pub const ErrorResponse = @import("pg/proto.zig").ErrorResponse;
+pub const FormatCode = @import("pg/proto.zig").FormatCode;
 
 test {
     _ = std.testing.refAllDecls(@This());
