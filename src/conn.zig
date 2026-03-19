@@ -6,6 +6,10 @@ const TlsClient = std.crypto.tls.Client;
 const TlsHost = @FieldType(TlsClient.Options, "host");
 const TlsCa = @FieldType(TlsClient.Options, "ca");
 
+comptime {
+    @setEvalBranchQuota(30000);
+}
+
 pub const Column = struct {
     name: []const u8,
     type_oid: u32,
@@ -31,16 +35,6 @@ pub const Value = union(enum) {
         type_oid: u32,
         bytes: []const u8,
     },
-};
-
-pub const QueryProtocol = enum {
-    simple,
-    extended,
-};
-
-pub const QueryOptions = struct {
-    protocol: QueryProtocol = .simple,
-    result_format: proto.FormatCode = .text,
 };
 
 pub const Date = struct {
@@ -73,113 +67,74 @@ pub fn CompiledResult(comptime RowT: type) type {
     };
 }
 
-pub fn CompiledQuery(comptime sql_text: []const u8, comptime Args: type, comptime RowT: type) type {
-    comptime validateCompiledQuerySpec(sql_text, Args, RowT);
+pub fn statement(comptime stmt_short_name: []const u8, comptime sql_text: []const u8, comptime Args: type, comptime RowT: type) type {
+    comptime {
+        validatePreparedStatementName(stmt_short_name);
+        validateCompiledQuerySpec(sql_text, Args, RowT);
+        validateStaticPreparedSpec(sql_text, Args);
+    }
 
     return struct {
         pub const sql = sql_text;
         pub const Params = Args;
         pub const Row = RowT;
-        pub const protocol = inferCompiledProtocol(sql_text, Args);
-        pub const has_static_param_types = compiledArgsHaveStaticTypes(Args);
+        pub const short_name = stmt_short_name;
+        pub const statement_name = stmt_short_name;
         pub const static_param_types = compiledStaticParamTypes(Args);
 
+        pub fn prepare(conn: *Conn) !void {
+            if (conn.prepared_compiled_statements.get(statement_name) != null) return;
+            try conn.prepareCompiledNamedStatement(statement_name, sql, static_param_types[0..]);
+        }
+
         pub fn query(conn: *Conn, allocator: std.mem.Allocator, args: Args) !CompiledResult(RowT) {
-            const raw = try runRawQuery(conn, allocator, args);
+            try prepare(conn);
+            const raw = try conn.queryCompiledPrepared(allocator, statement_name, args);
             return materializeCompiledResult(RowT, raw);
         }
 
         pub fn exec(conn: *Conn, allocator: std.mem.Allocator, args: Args) ![]const u8 {
-            return switch (protocol) {
-                .simple => conn.execOpts(allocator, sql_text, .{
-                    .protocol = .simple,
-                    .result_format = .text,
-                }),
-                .extended => if (has_static_param_types)
-                    conn.execCompiled(allocator, sql_text, args, static_param_types[0..], .{
-                        .protocol = .extended,
-                        .result_format = .text,
-                    })
-                else
-                    blk: {
-                    var scratch = std.heap.ArenaAllocator.init(allocator);
-                    defer scratch.deinit();
-                    const params = try encodeCompiledParams(scratch.allocator(), args);
-                    break :blk conn.execExtendedRawWithParamTypes(allocator, sql_text, params, compiledParamTypesForQuery(), .{
-                        .protocol = .extended,
-                        .result_format = .text,
-                    });
-                    },
-            };
+            try prepare(conn);
+            return conn.execCompiledPrepared(allocator, statement_name, args);
         }
 
-        pub fn queue(pipeline: *Pipeline, allocator: std.mem.Allocator, args: Args) !void {
-            switch (protocol) {
-                .simple => {
-                    if (pipeline.opts.protocol != .simple) return error.UnsupportedProtocol;
-                    try pipeline.query(sql_text);
-                },
-                .extended => {
-                    if (pipeline.opts.protocol != .extended) return error.UnsupportedProtocol;
-                    if (has_static_param_types) {
-                        try pipeline.conn.queuePipelineCompiledQuery(
-                            sql_text,
-                            args,
-                            static_param_types[0..],
-                            pipeline.opts.result_format,
-                            pipeline.next_portal_id,
-                        );
-                    } else {
-                        var scratch = std.heap.ArenaAllocator.init(allocator);
-                        defer scratch.deinit();
-                        const params = try encodeCompiledParams(scratch.allocator(), args);
-                        try pipeline.conn.queuePipelineParameterizedQuery(
-                        sql_text,
-                        params,
-                        compiledParamTypesForQuery(),
-                        pipeline.opts.result_format,
-                        pipeline.next_portal_id,
-                        );
-                    }
-                    pipeline.next_portal_id += 1;
-                    pipeline.pending += 1;
-                    pipeline.queued_since_flush += 1;
-                },
+        pub fn queue(pipeline: *Pipeline, args: Args) !void {
+            if (pipeline.conn.prepared_compiled_statements.get(statement_name) == null) {
+                if (pipeline.queued_since_flush != 0) return error.PipelineRequiresPreparedStatements;
+                try prepare(pipeline.conn);
             }
+            try pipeline.conn.queuePipelinePreparedCompiledExecute(
+                statement_name,
+                args,
+                .text,
+                pipeline.next_portal_id,
+            );
+            pipeline.next_portal_id += 1;
+            pipeline.pending += 1;
+            pipeline.queued_since_flush += 1;
         }
 
         pub fn read(pipeline: *Pipeline, allocator: std.mem.Allocator) !CompiledResult(RowT) {
             const raw = try pipeline.readQuery(allocator);
             return materializeCompiledResult(RowT, raw);
         }
+    };
+}
 
-        fn runRawQuery(conn: *Conn, allocator: std.mem.Allocator, args: Args) !Result {
-            return switch (protocol) {
-                .simple => conn.queryOpts(allocator, sql_text, .{
-                    .protocol = .simple,
-                    .result_format = .text,
-                }),
-                .extended => if (has_static_param_types)
-                    conn.queryCompiled(allocator, sql_text, args, static_param_types[0..], .{
-                        .protocol = .extended,
-                        .result_format = .text,
-                    })
-                else
-                    blk: {
-                    var scratch = std.heap.ArenaAllocator.init(allocator);
-                    defer scratch.deinit();
-                    const params = try encodeCompiledParams(scratch.allocator(), args);
-                    break :blk conn.queryExtendedRawWithParamTypes(allocator, sql_text, params, compiledParamTypesForQuery(), .{
-                        .protocol = .extended,
-                        .result_format = .text,
-                    });
-                    },
-            };
+pub fn Statements(comptime defs: anytype) type {
+    comptime validateStatementRegistry(defs);
+    const Queries = comptime statementRegistryTuple(defs);
+
+    return struct {
+        pub const stmt = defs;
+        pub const queries = Queries;
+
+        pub fn connect(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !*Conn {
+            return Conn.connectPreparedStatements(queries, allocator, io, config);
         }
 
-        fn compiledParamTypesForQuery() ?[]const u32 {
-            if (!has_static_param_types) return null;
-            return static_param_types[0..];
+        pub fn prepare(conn: *Conn) !void {
+            try conn.prepareCompiledStatements(queries);
         }
     };
 }
@@ -232,111 +187,24 @@ pub const Result = struct {
     }
 };
 
-pub const Statement = struct {
-    allocator: std.mem.Allocator,
-    conn: *Conn,
-    name: []u8,
-    closed: bool = false,
-
-    pub fn query(stmt: *Statement, allocator: std.mem.Allocator) !Result {
-        return stmt.queryValues(allocator, &.{}, .{});
-    }
-
-    pub fn queryValues(stmt: *Statement, allocator: std.mem.Allocator, values: []const Value, opts: QueryOptions) !Result {
-        return stmt.conn.queryPrepared(stmt.name, allocator, values, opts);
-    }
-
-    pub fn exec(stmt: *Statement, allocator: std.mem.Allocator) ![]const u8 {
-        return stmt.execValues(allocator, &.{}, .{});
-    }
-
-    pub fn execValues(stmt: *Statement, allocator: std.mem.Allocator, values: []const Value, opts: QueryOptions) ![]const u8 {
-        return stmt.conn.execPrepared(stmt.name, allocator, values, opts);
-    }
-
-    pub fn close(stmt: *Statement) !void {
-        if (stmt.closed) return;
-        stmt.closed = true;
-        defer stmt.allocator.free(stmt.name);
-        try stmt.conn.closePreparedStatement(stmt.name);
-    }
-
-    pub fn deinit(stmt: *Statement) void {
-        stmt.close() catch stmt.allocator.free(stmt.name);
-        stmt.* = undefined;
-    }
-};
-
 pub const Pipeline = struct {
     conn: *Conn,
-    opts: QueryOptions,
     pending: usize = 0,
     pending_in_batch: usize = 0,
     queued_since_flush: usize = 0,
     next_portal_id: u64 = 0,
 
-    pub fn init(conn: *Conn, opts: QueryOptions) Pipeline {
+    pub fn init(conn: *Conn) Pipeline {
         return .{
             .conn = conn,
-            .opts = opts,
         };
-    }
-
-    pub fn query(pipeline: *Pipeline, sql: []const u8) !void {
-        switch (pipeline.opts.protocol) {
-            .simple => {
-                if (pipeline.opts.result_format != .text) return error.UnsupportedResultFormat;
-                try pipeline.conn.queuePipelineSimpleQuery(sql);
-            },
-            .extended => {
-                try pipeline.conn.queuePipelineCachedQuery(sql, pipeline.opts.result_format, pipeline.next_portal_id);
-                pipeline.next_portal_id += 1;
-            },
-        }
-        pipeline.pending += 1;
-        pipeline.queued_since_flush += 1;
-    }
-
-    pub fn queryValues(pipeline: *Pipeline, allocator: std.mem.Allocator, sql: []const u8, values: []const Value) !void {
-        _ = allocator;
-        if (pipeline.opts.protocol == .simple) return error.UnsupportedProtocol;
-        try pipeline.conn.queuePipelineValueQuery(sql, values, pipeline.opts.result_format, pipeline.next_portal_id);
-        pipeline.next_portal_id += 1;
-        pipeline.pending += 1;
-        pipeline.queued_since_flush += 1;
-    }
-
-    pub fn execValues(pipeline: *Pipeline, allocator: std.mem.Allocator, sql: []const u8, values: []const Value) !void {
-        try pipeline.queryValues(allocator, sql, values);
-    }
-
-    pub fn preparedQueryValues(pipeline: *Pipeline, allocator: std.mem.Allocator, statement_name: []const u8, values: []const Value) !void {
-        _ = allocator;
-        if (pipeline.opts.protocol == .simple) return error.UnsupportedProtocol;
-        try pipeline.conn.queuePipelinePreparedValueExecute(statement_name, values, pipeline.opts.result_format, pipeline.next_portal_id);
-        pipeline.next_portal_id += 1;
-        pipeline.pending += 1;
-        pipeline.queued_since_flush += 1;
-    }
-
-    pub fn exec(pipeline: *Pipeline, sql: []const u8) !void {
-        try pipeline.query(sql);
-    }
-
-    pub fn preparedExecValues(pipeline: *Pipeline, allocator: std.mem.Allocator, statement_name: []const u8, values: []const Value) !void {
-        try pipeline.preparedQueryValues(allocator, statement_name, values);
     }
 
     pub fn flush(pipeline: *Pipeline) !void {
         if (pipeline.pending_in_batch != 0) return error.PendingResults;
         if (pipeline.queued_since_flush == 0) return;
-        switch (pipeline.opts.protocol) {
-            .simple => try pipeline.conn.flushPipelineSimpleQueries(),
-            .extended => {
-                try proto.appendSync(&pipeline.conn.queued_writes, pipeline.conn.allocator);
-                try pipeline.conn.flushWrites();
-            },
-        }
+        try proto.appendSync(&pipeline.conn.queued_writes, pipeline.conn.allocator);
+        try pipeline.conn.flushWrites();
         pipeline.pending_in_batch = pipeline.queued_since_flush;
         pipeline.queued_since_flush = 0;
     }
@@ -345,48 +213,24 @@ pub const Pipeline = struct {
         if (pipeline.pending == 0) return error.NoPendingResults;
         if (pipeline.pending_in_batch == 0) return error.PendingFlush;
         pipeline.pending -= 1;
-        return switch (pipeline.opts.protocol) {
-            .simple => blk: {
-                pipeline.pending_in_batch -= 1;
-                break :blk pipeline.conn.readPipelineSimpleQueryResult(allocator, pipeline.pending_in_batch == 0);
-            },
-            .extended => blk: {
-                pipeline.pending_in_batch -= 1;
-                break :blk pipeline.conn.readPipelineQueryResult(allocator, pipeline.pending_in_batch == 0);
-            },
-        };
+        pipeline.pending_in_batch -= 1;
+        return pipeline.conn.readPipelineQueryResult(allocator, pipeline.pending_in_batch == 0);
     }
 
     pub fn readExec(pipeline: *Pipeline, allocator: std.mem.Allocator) ![]const u8 {
         if (pipeline.pending == 0) return error.NoPendingResults;
         if (pipeline.pending_in_batch == 0) return error.PendingFlush;
         pipeline.pending -= 1;
-        return switch (pipeline.opts.protocol) {
-            .simple => blk: {
-                pipeline.pending_in_batch -= 1;
-                break :blk pipeline.conn.readPipelineSimpleExecResult(allocator, pipeline.pending_in_batch == 0);
-            },
-            .extended => blk: {
-                pipeline.pending_in_batch -= 1;
-                break :blk pipeline.conn.readPipelineExecResult(allocator, pipeline.pending_in_batch == 0);
-            },
-        };
+        pipeline.pending_in_batch -= 1;
+        return pipeline.conn.readPipelineExecResult(allocator, pipeline.pending_in_batch == 0);
     }
 
     pub fn discard(pipeline: *Pipeline) !void {
         if (pipeline.pending == 0) return error.NoPendingResults;
         if (pipeline.pending_in_batch == 0) return error.PendingFlush;
         pipeline.pending -= 1;
-        return switch (pipeline.opts.protocol) {
-            .simple => {
-                pipeline.pending_in_batch -= 1;
-                try pipeline.conn.discardPipelineSimpleQueryResult(pipeline.pending_in_batch == 0);
-            },
-            .extended => {
-                pipeline.pending_in_batch -= 1;
-                try pipeline.conn.discardPipelineExtendedResult(pipeline.pending_in_batch == 0);
-            },
-        };
+        pipeline.pending_in_batch -= 1;
+        try pipeline.conn.discardPipelineExtendedResult(pipeline.pending_in_batch == 0);
     }
 };
 
@@ -424,7 +268,7 @@ pub const Conn = struct {
     tx_status: u8 = 'I',
     healthy: bool = true,
     last_error: ?proto.ErrorResponse = null,
-    next_statement_id: u64 = 0,
+    prepared_compiled_statements: std.StringHashMapUnmanaged(void) = .empty,
     unnamed_statement_sql: []u8 = &.{},
     unnamed_statement_param_types: []u32 = &.{},
     pipeline_statement_sql: []u8 = &.{},
@@ -432,6 +276,13 @@ pub const Conn = struct {
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !*Conn {
         return create(allocator, io, config);
+    }
+
+    fn connectPreparedStatements(comptime Queries: anytype, allocator: std.mem.Allocator, io: std.Io, config: *const Config) !*Conn {
+        const conn = try create(allocator, io, config);
+        errdefer conn.destroy();
+        try conn.prepareCompiledStatements(Queries);
+        return conn;
     }
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, config: *const Config) !*Conn {
@@ -474,6 +325,7 @@ pub const Conn = struct {
         const allocator = conn.allocator;
         defer conn.* = undefined;
         if (conn.last_error) |*err| err.deinit(allocator);
+        conn.prepared_compiled_statements.deinit(allocator);
         conn.clearUnnamedStatementCache();
         conn.clearPipelineStatementCache();
         conn.queued_writes.clearRetainingCapacity();
@@ -494,51 +346,47 @@ pub const Conn = struct {
         conn.queued_simple_pipeline_sql.deinit(allocator);
     }
 
-    pub fn query(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) !Result {
-        return conn.queryOpts(allocator, sql, .{});
+    pub fn pipeline(conn: *Conn) Pipeline {
+        return Pipeline.init(conn);
     }
 
-    pub fn pipeline(conn: *Conn, opts: QueryOptions) Pipeline {
-        return Pipeline.init(conn, opts);
-    }
-
-    pub fn queueSimpleQuery(conn: *Conn, sql: []const u8) !void {
+    fn queueSimpleQuery(conn: *Conn, sql: []const u8) !void {
         conn.clearLastError();
         conn.clearUnnamedStatementCache();
         try conn.writeSimpleQueryBuffered(sql);
     }
 
-    pub fn queuePipelineSimpleQuery(conn: *Conn, sql: []const u8) !void {
+    fn queuePipelineSimpleQuery(conn: *Conn, sql: []const u8) !void {
         conn.clearLastError();
         conn.clearUnnamedStatementCache();
         try conn.queued_simple_pipeline_sql.appendSlice(conn.allocator, sql);
         try conn.queued_simple_pipeline_sql.append(conn.allocator, ';');
     }
 
-    pub fn flushPipelineSimpleQueries(conn: *Conn) !void {
+    fn flushPipelineSimpleQueries(conn: *Conn) !void {
         if (conn.queued_simple_pipeline_sql.items.len == 0) return;
         try conn.writeSimpleQueryBuffered(conn.queued_simple_pipeline_sql.items);
         conn.queued_simple_pipeline_sql.clearRetainingCapacity();
         try conn.flushWrites();
     }
 
-    pub fn readSimpleQueryResult(conn: *Conn, allocator: std.mem.Allocator) !Result {
+    fn readSimpleQueryResult(conn: *Conn, allocator: std.mem.Allocator) !Result {
         return conn.readQueryResult(allocator, false);
     }
 
-    pub fn readPipelineSimpleQueryResult(conn: *Conn, allocator: std.mem.Allocator, expect_ready: bool) !Result {
+    fn readPipelineSimpleQueryResult(conn: *Conn, allocator: std.mem.Allocator, expect_ready: bool) !Result {
         return conn.readQueryResultMode(allocator, false, expect_ready);
     }
 
-    pub fn readSimpleExecResult(conn: *Conn, allocator: std.mem.Allocator) ![]const u8 {
+    fn readSimpleExecResult(conn: *Conn, allocator: std.mem.Allocator) ![]const u8 {
         return conn.readExecResult(allocator, false);
     }
 
-    pub fn readPipelineSimpleExecResult(conn: *Conn, allocator: std.mem.Allocator, expect_ready: bool) ![]const u8 {
+    fn readPipelineSimpleExecResult(conn: *Conn, allocator: std.mem.Allocator, expect_ready: bool) ![]const u8 {
         return conn.readExecResultMode(allocator, false, expect_ready);
     }
 
-    pub fn discardSimpleQueryResult(conn: *Conn) !void {
+    fn discardSimpleQueryResult(conn: *Conn) !void {
         var failed = false;
         while (true) {
             const msg = try conn.readMessageHeader();
@@ -560,7 +408,7 @@ pub const Conn = struct {
         }
     }
 
-    pub fn discardPipelineSimpleQueryResult(conn: *Conn, expect_ready: bool) !void {
+    fn discardPipelineSimpleQueryResult(conn: *Conn, expect_ready: bool) !void {
         var failed = false;
         while (true) {
             const msg = try conn.readMessageHeader();
@@ -589,7 +437,7 @@ pub const Conn = struct {
         }
     }
 
-    pub fn discardExtendedResult(conn: *Conn) !void {
+    fn discardExtendedResult(conn: *Conn) !void {
         var failed = false;
         var saw_extended_control = false;
         while (true) {
@@ -617,41 +465,55 @@ pub const Conn = struct {
         }
     }
 
-    pub fn queryOpts(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, opts: QueryOptions) !Result {
-        if (opts.protocol == .simple and opts.result_format == .text) {
-            return conn.querySimple(allocator, sql);
-        }
-        return conn.queryExtendedRaw(allocator, sql, &.{}, opts);
-    }
-
-    pub fn queryValues(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) !Result {
-        return conn.queryExtendedValues(null, allocator, sql, values, opts);
-    }
-
-    pub fn exec(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
-        return conn.execOpts(allocator, sql, .{});
-    }
-
-    pub fn execOpts(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, opts: QueryOptions) ![]const u8 {
-        if (opts.protocol == .simple and opts.result_format == .text) {
-            return conn.execSimple(allocator, sql);
-        }
-        return conn.execExtendedRaw(allocator, sql, &.{}, opts);
-    }
-
-    pub fn execValues(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) ![]const u8 {
-        return conn.execExtendedValues(null, allocator, sql, values, opts);
-    }
-
-    pub fn prepare(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) !Statement {
-        conn.clearLastError();
-        const name = try std.fmt.allocPrint(allocator, "zpg_stmt_{x}", .{conn.next_statement_id});
-        errdefer allocator.free(name);
-        conn.next_statement_id += 1;
+    fn prepareCompiledStatements(conn: *Conn, comptime Queries: anytype) !void {
+        comptime validateCompiledQueryRegistry(Queries);
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(conn.allocator);
-        try proto.appendParse(&out, conn.allocator, name, sql, &.{});
+        var prepare_count: usize = 0;
+
+        inline for (Queries) |Query| {
+            if (conn.prepared_compiled_statements.get(Query.statement_name) == null) {
+                try proto.appendParse(&out, conn.allocator, Query.statement_name, Query.sql, Query.static_param_types[0..]);
+                prepare_count += 1;
+            }
+        }
+        if (prepare_count == 0) return;
+
+        try proto.appendSync(&out, conn.allocator);
+        try conn.writeMessages(out.items);
+
+        var parse_complete_count: usize = 0;
+        var failed = false;
+        while (true) {
+            const msg = try conn.readMessage();
+            switch (msg.tag) {
+                '1' => parse_complete_count += 1,
+                'E' => {
+                    failed = true;
+                    conn.setLastError(msg.payload) catch return conn.protocolError();
+                },
+                'S', 'N' => {},
+                'Z' => {
+                    try conn.finishReady(msg.payload);
+                    if (failed) return error.PgServer;
+                    if (parse_complete_count != prepare_count) return conn.protocolError();
+                    break;
+                },
+                else => return conn.protocolError(),
+            }
+        }
+
+        inline for (Queries) |Query| {
+            try conn.markCompiledPrepared(Query.statement_name);
+        }
+    }
+
+    fn prepareCompiledNamedStatement(conn: *Conn, statement_name: []const u8, sql: []const u8, param_types: []const u32) !void {
+        conn.clearLastError();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(conn.allocator);
+        try proto.appendParse(&out, conn.allocator, statement_name, sql, param_types);
         try proto.appendSync(&out, conn.allocator);
         try conn.writeMessages(out.items);
 
@@ -670,11 +532,8 @@ pub const Conn = struct {
                     try conn.finishReady(msg.payload);
                     if (failed) return error.PgServer;
                     if (!saw_parse_complete) return conn.protocolError();
-                    return .{
-                        .allocator = allocator,
-                        .conn = conn,
-                        .name = name,
-                    };
+                    try conn.markCompiledPrepared(statement_name);
+                    return;
                 },
                 else => return conn.protocolError(),
             }
@@ -689,155 +548,20 @@ pub const Conn = struct {
         return if (conn.last_error) |*err| err else null;
     }
 
-    fn queryPrepared(conn: *Conn, statement_name: []const u8, allocator: std.mem.Allocator, values: []const Value, opts: QueryOptions) !Result {
-        return conn.queryExtendedValues(statement_name, allocator, "", values, .{
-            .protocol = .extended,
-            .result_format = opts.result_format,
-        });
-    }
-
-    fn execPrepared(conn: *Conn, statement_name: []const u8, allocator: std.mem.Allocator, values: []const Value, opts: QueryOptions) ![]const u8 {
-        return conn.execExtendedValues(statement_name, allocator, "", values, .{
-            .protocol = .extended,
-            .result_format = opts.result_format,
-        });
-    }
-
-    fn closePreparedStatement(conn: *Conn, statement_name: []const u8) !void {
+    fn queryCompiledPrepared(conn: *Conn, allocator: std.mem.Allocator, statement_name: []const u8, args: anytype) !Result {
         conn.clearLastError();
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(conn.allocator);
-        try proto.appendClose(&out, conn.allocator, .statement, statement_name);
-        try proto.appendSync(&out, conn.allocator);
-        try conn.writeMessages(out.items);
-
-        var saw_close_complete = false;
-        var failed = false;
-        while (true) {
-            const msg = try conn.readMessage();
-            switch (msg.tag) {
-                '3' => saw_close_complete = true,
-                'E' => {
-                    failed = true;
-                    conn.setLastError(msg.payload) catch return conn.protocolError();
-                },
-                'S', 'N' => {},
-                'Z' => {
-                    try conn.finishReady(msg.payload);
-                    if (failed) return error.PgServer;
-                    if (!saw_close_complete) return conn.protocolError();
-                    return;
-                },
-                else => return conn.protocolError(),
-            }
-        }
-    }
-
-    fn querySimple(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) !Result {
-        conn.clearLastError();
-        conn.clearUnnamedStatementCache();
-        try conn.writeSimpleQueryBuffered(sql);
-        try conn.flushWrites();
-        return conn.readQueryResult(allocator, false);
-    }
-
-    fn execSimple(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
-        conn.clearLastError();
-        conn.clearUnnamedStatementCache();
-        try conn.writeSimpleQueryBuffered(sql);
-        try conn.flushWrites();
-        return conn.readExecResult(allocator, false);
-    }
-
-    fn queryExtendedValues(conn: *Conn, statement_name: ?[]const u8, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) !Result {
-        if (statement_name) |name| {
-            return conn.queryPreparedValues(name, allocator, values, opts);
-        }
-        return conn.queryExtendedDirect(allocator, sql, values, opts);
-    }
-
-    fn execExtendedValues(conn: *Conn, statement_name: ?[]const u8, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) ![]const u8 {
-        if (statement_name) |name| {
-            return conn.execPreparedValues(name, allocator, values, opts);
-        }
-        return conn.execExtendedDirect(allocator, sql, values, opts);
-    }
-
-    fn queryCompiled(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, args: anytype, static_param_types: []const u32, opts: QueryOptions) !Result {
-        conn.clearLastError();
-        try conn.sendCompiledExtendedQuery("", sql, args, static_param_types, opts.result_format, true);
+        try conn.sendCompiledExtendedQueryExecute(statement_name, args, .text);
         return conn.readQueryResult(allocator, true);
     }
 
-    fn execCompiled(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, args: anytype, static_param_types: []const u32, opts: QueryOptions) ![]const u8 {
+    fn execCompiledPrepared(conn: *Conn, allocator: std.mem.Allocator, statement_name: []const u8, args: anytype) ![]const u8 {
         conn.clearLastError();
-        try conn.sendCompiledExtendedQuery("", sql, args, static_param_types, opts.result_format, true);
-        return conn.readExecResult(allocator, true);
-    }
-
-    fn queryExtendedDirect(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) !Result {
-        conn.clearLastError();
-        try conn.sendValueExtendedQuery("", sql, values, opts.result_format, true);
-        return conn.readQueryResult(allocator, true);
-    }
-
-    fn queryPreparedValues(conn: *Conn, statement_name: []const u8, allocator: std.mem.Allocator, values: []const Value, opts: QueryOptions) !Result {
-        conn.clearLastError();
-        try conn.sendValueExtendedExecute(statement_name, values, opts.result_format);
-        return conn.readQueryResult(allocator, true);
-    }
-
-    fn execExtendedDirect(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) ![]const u8 {
-        conn.clearLastError();
-        try conn.sendValueExtendedQuery("", sql, values, opts.result_format, true);
-        return conn.readExecResult(allocator, true);
-    }
-
-    fn execPreparedValues(conn: *Conn, statement_name: []const u8, allocator: std.mem.Allocator, values: []const Value, opts: QueryOptions) ![]const u8 {
-        conn.clearLastError();
-        try conn.sendValueExtendedExecute(statement_name, values, opts.result_format);
-        return conn.readExecResult(allocator, true);
-    }
-
-    fn queryExtendedRaw(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, params: []const proto.Param, opts: QueryOptions) !Result {
-        return conn.queryExtendedRawWithParamTypes(allocator, sql, params, null, opts);
-    }
-
-    fn queryExtendedRawWithParamTypes(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, params: []const proto.Param, param_types_override: ?[]const u32, opts: QueryOptions) !Result {
-        conn.clearLastError();
-        try conn.sendExtendedQuery("", sql, params, param_types_override, opts.result_format, true);
-        return conn.readQueryResult(allocator, true);
-    }
-
-    fn queryPreparedRaw(conn: *Conn, statement_name: []const u8, allocator: std.mem.Allocator, params: []const proto.Param, opts: QueryOptions) !Result {
-        conn.clearLastError();
-        try conn.sendExtendedExecute(statement_name, params, opts.result_format);
-        return conn.readQueryResult(allocator, true);
-    }
-
-    fn execExtendedRaw(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, params: []const proto.Param, opts: QueryOptions) ![]const u8 {
-        return conn.execExtendedRawWithParamTypes(allocator, sql, params, null, opts);
-    }
-
-    fn execExtendedRawWithParamTypes(conn: *Conn, allocator: std.mem.Allocator, sql: []const u8, params: []const proto.Param, param_types_override: ?[]const u32, opts: QueryOptions) ![]const u8 {
-        conn.clearLastError();
-        try conn.sendExtendedQuery("", sql, params, param_types_override, opts.result_format, true);
-        return conn.readExecResult(allocator, true);
-    }
-
-    fn execPreparedRaw(conn: *Conn, statement_name: []const u8, allocator: std.mem.Allocator, params: []const proto.Param, opts: QueryOptions) ![]const u8 {
-        conn.clearLastError();
-        try conn.sendExtendedExecute(statement_name, params, opts.result_format);
+        try conn.sendCompiledExtendedExecute(statement_name, args, .text);
         return conn.readExecResult(allocator, true);
     }
 
     fn sendExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, params: []const proto.Param, param_types_override: ?[]const u32, result_format: proto.FormatCode, include_parse: bool) !void {
         try conn.queueExtendedQuery(statement_name, sql, params, param_types_override, result_format, include_parse);
-        try conn.flushWrites();
-    }
-
-    fn sendValueExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, values: []const Value, result_format: proto.FormatCode, include_parse: bool) !void {
-        try conn.queueValueExtendedQuery(statement_name, sql, values, result_format, include_parse);
         try conn.flushWrites();
     }
 
@@ -989,13 +713,13 @@ pub const Conn = struct {
         try conn.queuePipelineParameterizedQuery(sql, &.{}, &.{}, result_format, portal_id);
     }
 
-    fn sendExtendedExecute(conn: *Conn, statement_name: []const u8, params: []const proto.Param, result_format: proto.FormatCode) !void {
-        try conn.queueExtendedExecute(statement_name, params, result_format);
+    fn sendCompiledExtendedExecute(conn: *Conn, statement_name: []const u8, args: anytype, result_format: proto.FormatCode) !void {
+        try conn.queueCompiledExtendedExecute(statement_name, args, result_format);
         try conn.flushWrites();
     }
 
-    fn sendValueExtendedExecute(conn: *Conn, statement_name: []const u8, values: []const Value, result_format: proto.FormatCode) !void {
-        try conn.queueValueExtendedExecute(statement_name, values, result_format);
+    fn sendCompiledExtendedQueryExecute(conn: *Conn, statement_name: []const u8, args: anytype, result_format: proto.FormatCode) !void {
+        try conn.queueCompiledExtendedQueryExecute(statement_name, args, result_format);
         try conn.flushWrites();
     }
 
@@ -1017,6 +741,25 @@ pub const Conn = struct {
         appendSyncAssumeCapacity(&conn.queued_writes);
     }
 
+    fn queueCompiledExtendedExecute(conn: *Conn, statement_name: []const u8, args: anytype, result_format: proto.FormatCode) !void {
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try compiledExtendedExecuteMessageLenFor("", statement_name, args, true));
+        try appendBindCompiledArgsAssumeCapacity(&conn.queued_writes, "", statement_name, args, result_format);
+        appendExecuteAssumeCapacity(&conn.queued_writes, "", 0);
+        appendSyncAssumeCapacity(&conn.queued_writes);
+    }
+
+    fn queueCompiledExtendedQueryExecute(conn: *Conn, statement_name: []const u8, args: anytype, result_format: proto.FormatCode) !void {
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try compiledExtendedQueryExecuteMessageLenFor("", statement_name, args, true));
+        try appendBindCompiledArgsAssumeCapacity(&conn.queued_writes, "", statement_name, args, result_format);
+        appendDescribeAssumeCapacity(&conn.queued_writes, .portal, "");
+        appendExecuteAssumeCapacity(&conn.queued_writes, "", 0);
+        appendSyncAssumeCapacity(&conn.queued_writes);
+    }
+
     fn queuePipelinePreparedExecute(conn: *Conn, statement_name: []const u8, params: []const proto.Param, result_format: proto.FormatCode, portal_id: u64) !void {
         var portal_buf: [18]u8 = undefined;
         const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
@@ -1034,6 +777,16 @@ pub const Conn = struct {
         errdefer conn.queued_writes.items.len = start;
         try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try valueExtendedExecuteMessageLenFor(portal_name, statement_name, values, false));
         try appendBindValuesAssumeCapacity(&conn.queued_writes, portal_name, statement_name, values, result_format);
+        appendExecuteAssumeCapacity(&conn.queued_writes, portal_name, 0);
+    }
+
+    fn queuePipelinePreparedCompiledExecute(conn: *Conn, statement_name: []const u8, args: anytype, result_format: proto.FormatCode, portal_id: u64) !void {
+        var portal_buf: [18]u8 = undefined;
+        const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
+        const start = conn.queued_writes.items.len;
+        errdefer conn.queued_writes.items.len = start;
+        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try compiledExtendedExecuteMessageLenFor(portal_name, statement_name, args, false));
+        try appendBindCompiledArgsAssumeCapacity(&conn.queued_writes, portal_name, statement_name, args, result_format);
         appendExecuteAssumeCapacity(&conn.queued_writes, portal_name, 0);
     }
 
@@ -1314,6 +1067,15 @@ pub const Conn = struct {
             conn.allocator.free(conn.pipeline_statement_param_types);
             conn.pipeline_statement_param_types = &.{};
         }
+    }
+
+    fn markCompiledPrepared(conn: *Conn, statement_name: []const u8) !void {
+        _ = try conn.prepared_compiled_statements.getOrPut(conn.allocator, statement_name);
+    }
+
+    fn ensureCompiledPrepared(conn: *Conn, comptime Query: type) !void {
+        if (conn.prepared_compiled_statements.get(Query.statement_name) != null) return;
+        try conn.prepareCompiledNamedStatement(Query.statement_name, Query.sql, Query.static_param_types[0..]);
     }
 
     fn matchesUnnamedStatement(conn: *const Conn, sql: []const u8, param_types: []const u32) bool {
@@ -1668,6 +1430,12 @@ fn appendCloseAssumeCapacity(out: *std.ArrayList(u8), target: proto.CloseTarget,
     appendCStringAssumeCapacity(out, name);
 }
 
+fn appendDescribeAssumeCapacity(out: *std.ArrayList(u8), target: proto.CloseTarget, name: []const u8) void {
+    appendTaggedHeaderAssumeCapacity(out, 'D', 1 + name.len + 1);
+    appendAssumeCapacity(out, @intFromEnum(target));
+    appendCStringAssumeCapacity(out, name);
+}
+
 fn runtimeValueTypeOid(value: Value) u32 {
     return switch (value) {
         .null => 0,
@@ -1826,7 +1594,11 @@ fn compiledArgEncodedLen(arg: anytype) !?usize {
         },
         .pointer => |info| switch (info.size) {
             .slice => if (info.child == u8) arg.len else @compileError("compiled query slice arguments must be []const u8 or []u8"),
-            else => @compileError("compiled query pointer arguments must be slices"),
+            .one => switch (@typeInfo(info.child)) {
+                .array => |array_info| if (array_info.child == u8) array_info.len else @compileError("compiled query pointer arguments must reference [N]u8 when not slices"),
+                else => @compileError("compiled query pointer arguments must be slices or pointers to [N]u8"),
+            },
+            else => @compileError("compiled query pointer arguments must be slices or pointers to [N]u8"),
         },
         .array => |info| if (info.child == u8) arg.len else @compileError("compiled query array arguments must be [N]u8"),
         else => @compileError("unsupported compiled query argument type"),
@@ -1891,7 +1663,14 @@ fn appendCompiledArgBytesAssumeCapacity(out: *std.ArrayList(u8), arg: anytype) !
                 appendSliceAssumeCapacity(out, arg)
             else
                 @compileError("compiled query slice arguments must be []const u8 or []u8"),
-            else => @compileError("compiled query pointer arguments must be slices"),
+            .one => switch (@typeInfo(info.child)) {
+                .array => |array_info| if (array_info.child == u8)
+                    appendSliceAssumeCapacity(out, arg[0..array_info.len])
+                else
+                    @compileError("compiled query pointer arguments must reference [N]u8 when not slices"),
+                else => @compileError("compiled query pointer arguments must be slices or pointers to [N]u8"),
+            },
+            else => @compileError("compiled query pointer arguments must be slices or pointers to [N]u8"),
         },
         .array => |info| if (info.child == u8)
             appendSliceAssumeCapacity(out, arg[0..])
@@ -1922,6 +1701,14 @@ fn compiledExtendedQueryMessageLenFor(portal_name: []const u8, statement_name: [
 
 fn compiledExtendedExecuteMessageLenFor(portal_name: []const u8, statement_name: []const u8, args: anytype, include_sync: bool) !usize {
     var len = try compiledBindMessageLen(portal_name, statement_name, args) + executeMessageLen(portal_name);
+    if (include_sync) len += syncMessageLen();
+    return len;
+}
+
+fn compiledExtendedQueryExecuteMessageLenFor(portal_name: []const u8, statement_name: []const u8, args: anytype, include_sync: bool) !usize {
+    var len = try compiledBindMessageLen(portal_name, statement_name, args) +
+        describeMessageLen(portal_name) +
+        executeMessageLen(portal_name);
     if (include_sync) len += syncMessageLen();
     return len;
 }
@@ -1966,9 +1753,31 @@ fn validateCompiledQuerySpec(comptime sql_text: []const u8, comptime Args: type,
     }
 }
 
-fn inferCompiledProtocol(comptime sql_text: []const u8, comptime Args: type) QueryProtocol {
-    _ = Args;
-    return if (sqlPlaceholderCount(sql_text) == 0) .simple else .extended;
+fn validateStaticPreparedSpec(comptime sql_text: []const u8, comptime Args: type) void {
+    comptime {
+        const expected_params = sqlPlaceholderCount(sql_text);
+        const actual_params = compiledArgCount(Args);
+        if (expected_params != actual_params) {
+            @compileError(std.fmt.comptimePrint(
+                "prepared query placeholder count mismatch for `{s}`: expected {d}, got {d}",
+                .{ sql_text, expected_params, actual_params },
+            ));
+        }
+        if (!compiledArgsHaveStaticTypes(Args)) {
+            @compileError("prepared query arguments must have static comptime-known PostgreSQL types");
+        }
+    }
+}
+
+fn validatePreparedStatementName(comptime short_name: []const u8) void {
+    comptime {
+        if (short_name.len == 0) @compileError("prepared statement short name must not be empty");
+        for (short_name) |ch| {
+            if (ch == 0) @compileError("prepared statement short name must not contain NUL bytes");
+            const ok = std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-';
+            if (!ok) @compileError("prepared statement short name must use only [A-Za-z0-9_-]");
+        }
+    }
 }
 
 fn compiledArgCount(comptime Args: type) usize {
@@ -1976,6 +1785,61 @@ fn compiledArgCount(comptime Args: type) usize {
         .@"struct" => |info| info.fields.len,
         else => @compileError("compiled query args must be a tuple or struct"),
     };
+}
+
+fn validateCompiledQueryRegistry(comptime Queries: anytype) void {
+    comptime {
+        const QueryList = @TypeOf(Queries);
+        switch (@typeInfo(QueryList)) {
+            .@"struct" => {},
+            else => @compileError("prepared statement registry must be a tuple of zpg.statement(...) types"),
+        }
+        for (Queries) |Query| {
+            if (!@hasDecl(Query, "sql") or !@hasDecl(Query, "statement_name") or !@hasDecl(Query, "static_param_types") or !@hasDecl(Query, "Params")) {
+                @compileError("prepared statement registry entries must be zpg.statement(...) types");
+            }
+        }
+    }
+}
+
+fn validateStatementRegistry(comptime defs: anytype) void {
+    comptime {
+        const DefsT = @TypeOf(defs);
+        const info = @typeInfo(DefsT);
+        if (info != .@"struct" or info.@"struct".is_tuple) {
+            @compileError("statement registry must be a named struct literal like .{ .name = zpg.statement(...) }");
+        }
+
+        for (info.@"struct".fields, 0..) |field, i| {
+            const Stmt = @field(defs, field.name);
+            if (@TypeOf(Stmt) != type or !@hasDecl(Stmt, "sql") or !@hasDecl(Stmt, "statement_name") or !@hasDecl(Stmt, "Params") or !@hasDecl(Stmt, "Row")) {
+                @compileError("statement registry entries must be types returned by zpg.statement(...)");
+            }
+            for (info.@"struct".fields[0..i]) |prev| {
+                const Prev = @field(defs, prev.name);
+                if (std.mem.eql(u8, Stmt.statement_name, Prev.statement_name)) {
+                    @compileError(std.fmt.comptimePrint(
+                        "duplicate prepared statement short name `{s}` in registry fields `{s}` and `{s}`",
+                        .{ Stmt.statement_name, prev.name, field.name },
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn statementRegistryTupleType(comptime defs: anytype) type {
+    const fields = @typeInfo(@TypeOf(defs)).@"struct".fields;
+    return std.meta.Tuple(&([_]type{type} ** fields.len));
+}
+
+fn statementRegistryTuple(comptime defs: anytype) statementRegistryTupleType(defs) {
+    const fields = @typeInfo(@TypeOf(defs)).@"struct".fields;
+    var out: statementRegistryTupleType(defs) = undefined;
+    inline for (fields, 0..) |field, i| {
+        @field(out, std.fmt.comptimePrint("{d}", .{i})) = @field(defs, field.name);
+    }
+    return out;
 }
 
 fn compiledArgsHaveStaticTypes(comptime Args: type) bool {
@@ -2017,7 +1881,11 @@ fn compiledStaticArgTypeOid(comptime T: type) ?u32 {
         },
         .pointer => |info| switch (info.size) {
             .slice => if (info.child == u8) 25 else @compileError("compiled query slice arguments must be []const u8 or []u8"),
-            else => @compileError("compiled query pointer arguments must be slices"),
+            .one => switch (@typeInfo(info.child)) {
+                .array => |array_info| if (array_info.child == u8) 25 else @compileError("compiled query pointer arguments must reference [N]u8 when not slices"),
+                else => @compileError("compiled query pointer arguments must be slices or pointers to [N]u8"),
+            },
+            else => @compileError("compiled query pointer arguments must be slices or pointers to [N]u8"),
         },
         .array => |info| if (info.child == u8) 25 else @compileError("compiled query array arguments must be [N]u8"),
         else => @compileError("unsupported compiled query argument type; use scalars, temporal/uuid types, byte/text slices, optionals, or zpg.Value"),
@@ -2025,6 +1893,9 @@ fn compiledStaticArgTypeOid(comptime T: type) ?u32 {
 }
 
 fn sqlPlaceholderCount(comptime sql_text: []const u8) usize {
+    comptime {
+        @setEvalBranchQuota(30000);
+    }
     var i: usize = 0;
     var max_index: usize = 0;
     while (i < sql_text.len) : (i += 1) {
@@ -2393,6 +2264,10 @@ fn bindMessageLen(portal_name: []const u8, statement_name: []const u8, params: [
 
 fn executeMessageLen(portal_name: []const u8) usize {
     return taggedMessageLen(portal_name.len + 1 + 4);
+}
+
+fn describeMessageLen(name: []const u8) usize {
+    return taggedMessageLen(1 + name.len + 1);
 }
 
 fn syncMessageLen() usize {
@@ -2900,12 +2775,14 @@ test "sql placeholder count ignores line and nested block comments" {
     ));
 }
 
-test "compiled query infers protocol from placeholder usage" {
-    const SimpleQuery = CompiledQuery("select 1", struct {}, struct { n: i32 });
-    const ExtendedQuery = CompiledQuery("select $1::int4", struct { i32 }, struct { n: i32 });
+test "statement uses prepared extended protocol" {
+    const SimpleStmt = statement("simple_stmt", "select 1", struct {}, struct { n: i32 });
+    const ExtendedStmt = statement("extended_stmt", "select $1::int4", struct { i32 }, struct { n: i32 });
 
-    try std.testing.expectEqual(QueryProtocol.simple, SimpleQuery.protocol);
-    try std.testing.expectEqual(QueryProtocol.extended, ExtendedQuery.protocol);
+    try std.testing.expectEqualSlices(u32, &.{}, SimpleStmt.static_param_types[0..]);
+    try std.testing.expectEqualSlices(u32, &.{23}, ExtendedStmt.static_param_types[0..]);
+    try std.testing.expectEqualStrings("simple_stmt", SimpleStmt.statement_name);
+    try std.testing.expectEqualStrings("extended_stmt", ExtendedStmt.statement_name);
 }
 
 test "compiled arg encoder covers scalars optionals arrays and raw binary" {
@@ -3200,6 +3077,22 @@ test "pipeline statement cache keys include parameter types" {
     try conn.queuePipelineParameterizedQuery("select $1", &.{.{ .type_oid = 25, .value = "x" }}, &.{25}, .text, 2);
     try std.testing.expectEqual(@as(u8, 'C'), conn.queued_writes.items[0]);
     try std.testing.expect(std.mem.indexOfScalar(u8, conn.queued_writes.items, 'P') != null);
+}
+
+test "pipeline rejects cold mixed-statement batch without preprepare" {
+    const S = statement("cold_stmt", "select 1", struct {}, struct { n: i32 });
+    var conn: Conn = undefined;
+    conn.allocator = std.testing.allocator;
+    conn.prepared_compiled_statements = .empty;
+    defer conn.prepared_compiled_statements.deinit(std.testing.allocator);
+
+    var pipeline = Pipeline.init(&conn);
+    pipeline.queued_since_flush = 1;
+
+    try std.testing.expectError(
+        error.PipelineRequiresPreparedStatements,
+        S.queue(&pipeline, .{}),
+    );
 }
 
 test "read query result mode rejects extended sequence without control message" {

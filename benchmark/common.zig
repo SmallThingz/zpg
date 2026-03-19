@@ -7,10 +7,8 @@ pub const BenchmarkMode = enum {
 };
 
 pub const ZpgVariant = enum {
-    simple,
-    extended,
-    simple_pipeline,
-    extended_pipeline,
+    prepared,
+    prepared_pipeline,
 };
 
 pub const SummaryMeta = struct {
@@ -128,10 +126,8 @@ pub fn modeName(mode: BenchmarkMode) []const u8 {
 
 pub fn variantName(variant: ZpgVariant) []const u8 {
     return switch (variant) {
-        .simple => "simple",
-        .extended => "extended",
-        .simple_pipeline => "simple-pipeline",
-        .extended_pipeline => "extended-pipeline",
+        .prepared => "prepared",
+        .prepared_pipeline => "prepared-pipeline",
     };
 }
 

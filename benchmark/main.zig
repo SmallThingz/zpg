@@ -3,6 +3,16 @@ const builtin = @import("builtin");
 const zpg = @import("zpg");
 const common = @import("common.zig");
 
+const benchmark_sql = "select 1";
+const BenchDb = zpg.Statements(.{
+    .ping = zpg.statement(
+        "ping",
+        benchmark_sql,
+        struct {},
+        struct { n: i32 },
+    ),
+});
+
 const Options = struct {
     mode: common.BenchmarkMode,
     latency_iterations: usize,
@@ -14,7 +24,7 @@ const Options = struct {
     throughput_pipeline_depth: usize,
     throughput_shim_connections: usize,
     shim_binary: ?[]const u8 = null,
-    sql: []const u8 = "select 1",
+    sql: []const u8 = benchmark_sql,
     help: bool = false,
 
     fn defaults() Options {
@@ -49,7 +59,6 @@ const ThroughputGate = struct {
 const PipelineWorkerArgs = struct {
     io: std.Io,
     url: []const u8,
-    sql: []const u8,
     variant: common.ZpgVariant,
     warmup: usize,
     depth: usize,
@@ -66,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
         printUsage();
         return;
     }
+    if (!std.mem.eql(u8, options.sql, benchmark_sql)) return error.UnsupportedDynamicBenchmarkSql;
 
     const shim_binary = options.shim_binary orelse return error.MissingShimBinary;
 
@@ -127,17 +137,13 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
 fn runLatencySuite(allocator: std.mem.Allocator, io: std.Io, url: []const u8, shim_binary: []const u8, options: Options) !void {
     std.debug.print("suite mode=latency sql={s}\n", .{options.sql});
 
-    const simple = try runZpgLatency(allocator, io, url, options.sql, options.latency_warmup, options.latency_iterations, .simple);
-    simple.print();
-
-    const extended = try runZpgLatency(allocator, io, url, options.sql, options.latency_warmup, options.latency_iterations, .extended);
-    extended.print();
+    const prepared = try runZpgLatency(allocator, io, url, options.latency_warmup, options.latency_iterations);
+    prepared.print();
 
     const shim = try runShimBenchmark(allocator, io, shim_binary, .latency, url, options);
     shim.print();
 
-    common.printComparison(.latency, simple, shim);
-    common.printComparison(.latency, extended, shim);
+    common.printComparison(.latency, prepared, shim);
 }
 
 fn runThroughputSuite(allocator: std.mem.Allocator, io: std.Io, url: []const u8, shim_binary: []const u8, options: Options) !void {
@@ -145,54 +151,38 @@ fn runThroughputSuite(allocator: std.mem.Allocator, io: std.Io, url: []const u8,
     const total_requests = options.throughput_workers * options.throughput_per_worker;
     const pipeline_connections = @min(options.throughput_workers, options.throughput_pool);
 
-    const simple = try runZpgPipelinedThroughput(
+    const prepared = try runZpgPipelinedThroughput(
         allocator,
         io,
         url,
-        options.sql,
         options.throughput_warmup,
         total_requests,
         pipeline_connections,
         options.throughput_pipeline_depth,
-        .simple_pipeline,
+        .prepared_pipeline,
     );
-    simple.print();
-
-    const extended = try runZpgPipelinedThroughput(
-        allocator,
-        io,
-        url,
-        options.sql,
-        options.throughput_warmup,
-        total_requests,
-        pipeline_connections,
-        options.throughput_pipeline_depth,
-        .extended_pipeline,
-    );
-    extended.print();
+    prepared.print();
 
     const shim = try runShimBenchmark(allocator, io, shim_binary, .throughput, url, options);
     shim.print();
 
-    common.printComparison(.throughput, simple, shim);
-    common.printComparison(.throughput, extended, shim);
+    common.printComparison(.throughput, prepared, shim);
 }
 
 fn runZpgLatency(
     allocator: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
-    sql: []const u8,
     warmup: usize,
     iterations: usize,
-    variant: common.ZpgVariant,
 ) !common.Summary {
     var config = try zpg.Config.parseUri(allocator, url);
-    const conn = try zpg.Conn.connect(allocator, io, &config);
+    defer config.deinit(allocator);
+    const conn = try BenchDb.connect(allocator, io, &config);
+    defer conn.destroy();
 
-    const query_options = queryOptions(variant);
     for (0..warmup) |_| {
-        var result = try conn.queryOpts(allocator, sql, query_options);
+        var result = try BenchDb.stmt.ping.query(conn, allocator, .{});
         result.deinit();
     }
 
@@ -202,12 +192,12 @@ fn runZpgLatency(
     const started = monoNowNs();
     for (samples) |*sample| {
         const op_started = monoNowNs();
-        var result = try conn.queryOpts(allocator, sql, query_options);
+        var result = try BenchDb.stmt.ping.query(conn, allocator, .{});
         result.deinit();
         sample.* = monoNowNs() - op_started;
     }
 
-    return common.summarize(samples, monoNowNs() - started, "zpg", .latency, common.variantName(variant), .{
+    return common.summarize(samples, monoNowNs() - started, "zpg", .latency, common.variantName(.prepared), .{
         .warmup = warmup,
         .workers = 1,
         .connections = 1,
@@ -218,7 +208,6 @@ fn runZpgPipelinedThroughput(
     allocator: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
-    sql: []const u8,
     warmup: usize,
     requests: usize,
     connections: usize,
@@ -240,7 +229,6 @@ fn runZpgPipelinedThroughput(
         thread.* = try std.Thread.spawn(.{}, pipelineWorkerMain, .{PipelineWorkerArgs{
             .io = io,
             .url = url,
-            .sql = sql,
             .variant = variant,
             .warmup = warmup,
             .depth = depth,
@@ -268,21 +256,24 @@ fn runZpgPipelinedThroughput(
 fn pipelineWorkerMain(args: PipelineWorkerArgs) !void {
     const allocator = std.heap.page_allocator;
     var config = try zpg.Config.parseUri(allocator, args.url);
-    const conn = try zpg.Conn.connect(allocator, args.io, &config);
+    defer config.deinit(allocator);
+    const conn = try BenchDb.connect(allocator, args.io, &config);
+    defer conn.destroy();
 
-    try runPipeline(args.io, conn, args.sql, args.variant, args.warmup, args.depth, null);
+    try runPipeline(args.io, conn, args.variant, args.warmup, args.depth, null);
 
     _ = args.gate.ready.fetchAdd(1, .acq_rel);
     while (!args.gate.start.load(.acquire)) std.atomic.spinLoopHint();
 
-    try runPipeline(args.io, conn, args.sql, args.variant, args.samples.len, args.depth, args.samples);
+    try runPipeline(args.io, conn, args.variant, args.samples.len, args.depth, args.samples);
 }
 
-fn runPipeline(io: std.Io, conn: *zpg.Conn, sql: []const u8, variant: common.ZpgVariant, count: usize, depth: usize, maybe_samples: ?[]u64) !void {
+fn runPipeline(io: std.Io, conn: *zpg.Conn, variant: common.ZpgVariant, count: usize, depth: usize, maybe_samples: ?[]u64) !void {
     _ = io;
     if (count == 0) return;
 
-    var pipeline = conn.pipeline(queryOptions(variant));
+    _ = variant;
+    var pipeline = conn.pipeline();
     var sent: usize = 0;
     var completed: usize = 0;
 
@@ -290,7 +281,7 @@ fn runPipeline(io: std.Io, conn: *zpg.Conn, sql: []const u8, variant: common.Zpg
         const batch_end = @min(sent + depth, count);
         while (sent < batch_end) {
             if (maybe_samples) |samples| samples[sent] = monoNowNs();
-            try pipeline.query(sql);
+            try BenchDb.stmt.ping.queue(&pipeline, .{});
             sent += 1;
         }
         try pipeline.flush();
@@ -393,15 +384,6 @@ fn firstSummaryLine(output: []const u8) ?[]const u8 {
     return null;
 }
 
-fn queryOptions(variant: common.ZpgVariant) zpg.QueryOptions {
-    return .{
-        .protocol = switch (variant) {
-            .simple, .simple_pipeline => .simple,
-            .extended, .extended_pipeline => .extended,
-        },
-    };
-}
-
 fn parseMode(text: []const u8) !common.BenchmarkMode {
     if (std.mem.eql(u8, text, "compare")) return .compare;
     if (std.mem.eql(u8, text, "latency")) return .latency;
@@ -428,7 +410,7 @@ fn printUsage() void {
         \\usage: zpg-benchmark --shim-binary <path> [options]
         \\
         \\  --mode compare|latency|throughput
-        \\  --sql <query>
+        \\  --sql <query>              currently only `select 1` is supported
         \\  --latency-iterations <n>
         \\  --latency-warmup <n>
         \\  --throughput-workers <n>

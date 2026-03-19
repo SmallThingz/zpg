@@ -1,9 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const Conn = @import("conn.zig").Conn;
-const Result = @import("conn.zig").Result;
-const QueryOptions = @import("conn.zig").QueryOptions;
-const Value = @import("conn.zig").Value;
 
 pub const Stats = struct {
     max_size: usize,
@@ -98,42 +95,6 @@ pub const Pool = struct {
         };
         pool.condition.signal(pool.io);
         pool.mutex.unlock(pool.io);
-    }
-
-    pub fn query(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8) !Result {
-        const conn = try pool.acquire();
-        defer pool.release(conn);
-        return conn.query(allocator, sql);
-    }
-
-    pub fn queryOpts(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, opts: QueryOptions) !Result {
-        const conn = try pool.acquire();
-        defer pool.release(conn);
-        return conn.queryOpts(allocator, sql, opts);
-    }
-
-    pub fn queryValues(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) !Result {
-        const conn = try pool.acquire();
-        defer pool.release(conn);
-        return conn.queryValues(allocator, sql, values, opts);
-    }
-
-    pub fn exec(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
-        const conn = try pool.acquire();
-        defer pool.release(conn);
-        return conn.exec(allocator, sql);
-    }
-
-    pub fn execOpts(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, opts: QueryOptions) ![]const u8 {
-        const conn = try pool.acquire();
-        defer pool.release(conn);
-        return conn.execOpts(allocator, sql, opts);
-    }
-
-    pub fn execValues(pool: *Pool, allocator: std.mem.Allocator, sql: []const u8, values: []const Value, opts: QueryOptions) ![]const u8 {
-        const conn = try pool.acquire();
-        defer pool.release(conn);
-        return conn.execValues(allocator, sql, values, opts);
     }
 
     pub fn stats(pool: *Pool) Stats {

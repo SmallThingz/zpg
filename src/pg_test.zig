@@ -61,16 +61,29 @@ test "pool query against local postgres" {
     var pool = try zpg.Pool.initUri(std.testing.allocator, std.testing.io, url, 2);
     defer pool.deinit();
 
-    var result = try pool.query(std.testing.allocator, "select 'ok' as status, 7::int as n");
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 2), result.columns.len);
-    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
-    try std.testing.expectEqualStrings("ok", result.rows[0].get(0).?);
-    try std.testing.expectEqualStrings("7", result.rows[0].get(1).?);
+    const PoolDb = zpg.Statements(.{
+        .pool_query = zpg.statement(
+            "pool_query",
+            "select 'ok' as status, 7::int as n",
+            struct {},
+            struct {
+                status: []const u8,
+                n: i32,
+            },
+        ),
+        .pool_exec = zpg.statement("pool_exec", "select 1", struct {}, struct {}),
+    });
+    const pooled_conn = try pool.acquire();
 
-    const tag = try pool.exec(std.testing.allocator, "select 1");
+    var result = try PoolDb.stmt.pool_query.query(pooled_conn, std.testing.allocator, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("ok", result.rows[0].status);
+    try std.testing.expectEqual(@as(i32, 7), result.rows[0].n);
+
+    const tag = try PoolDb.stmt.pool_exec.exec(pooled_conn, std.testing.allocator, .{});
     defer std.testing.allocator.free(tag);
     try std.testing.expectEqualStrings("SELECT 1", tag);
+    pool.release(pooled_conn);
 
     const stats = pool.stats();
     try std.testing.expectEqual(@as(usize, 1), stats.open);
@@ -79,31 +92,66 @@ test "pool query against local postgres" {
     var cfg = try zpg.Config.parseUri(std.testing.allocator, url);
     defer cfg.deinit(std.testing.allocator);
 
-    const conn = try zpg.Conn.connect(std.testing.allocator, std.testing.io, &cfg);
+    const Db = zpg.Statements(.{
+        .conn_status = zpg.statement("conn_status", "select 'conn' as status", struct {}, struct { status: []const u8 }),
+        .pipeline_number = zpg.statement("pipeline_number", "select 7 as n", struct {}, struct { n: i32 }),
+        .pipeline_label = zpg.statement("pipeline_label", "select 'pipe' as label", struct {}, struct { label: []const u8 }),
+        .parameter_pipeline = zpg.statement(
+            "parameter_pipeline",
+            "select $1::text as label, $2::int4 as n",
+            struct { []const u8, i32 },
+            struct {
+                label: []const u8,
+                n: i32,
+            },
+        ),
+        .parameter_pipeline_exec = zpg.statement("parameter_pipeline_exec", "select $1::int4", struct { i32 }, struct {}),
+        .prepared_pipeline_label = zpg.statement(
+            "prepared_pipeline_label",
+            "select $1::text as prepared_label",
+            struct { []const u8 },
+            struct { prepared_label: []const u8 },
+        ),
+        .static_conn = zpg.statement(
+            "static_conn",
+            "select 'compiled' as status, 11::int4 as n",
+            struct {},
+            struct {
+                status: []const u8,
+                n: i32,
+            },
+        ),
+        .static_param = zpg.statement(
+            "static_param",
+            "select $1::text as status, $2::int4 as n",
+            struct { []const u8, i32 },
+            struct {
+                status: []const u8,
+                n: i32,
+            },
+        ),
+        .temporal_param = zpg.statement(
+            "temporal_param",
+            "select $1::uuid as uuid_v, $2::date as d, $3::time as t, $4::timestamp as ts",
+            struct { [16]u8, zpg.Date, zpg.Time, zpg.Timestamp },
+            struct {
+                uuid_v: [16]u8,
+                d: zpg.Date,
+                t: zpg.Time,
+                ts: zpg.Timestamp,
+            },
+        ),
+    });
+    const conn = try Db.connect(std.testing.allocator, std.testing.io, &cfg);
     defer conn.destroy();
 
-    var conn_result = try conn.query(std.testing.allocator, "select 'conn' as status");
+    var conn_result = try Db.stmt.conn_status.query(conn, std.testing.allocator, .{});
     defer conn_result.deinit();
-    try std.testing.expectEqualStrings("conn", conn_result.rows[0].get(0).?);
+    try std.testing.expectEqualStrings("conn", conn_result.rows[0].status);
 
-    var simple_pipeline = conn.pipeline(.{ .protocol = .simple });
-    try simple_pipeline.query("select 'p1' as status");
-    try simple_pipeline.query("select 'p2' as status");
-    try simple_pipeline.flush();
-
-    var p1 = try simple_pipeline.readQuery(std.testing.allocator);
-    defer p1.deinit();
-    try std.testing.expectEqualStrings("p1", p1.rows[0].get(0).?);
-
-    var p2 = try simple_pipeline.readQuery(std.testing.allocator);
-    defer p2.deinit();
-    try std.testing.expectEqualStrings("p2", p2.rows[0].get(0).?);
-
-    var extended_pipeline = conn.pipeline(.{
-        .protocol = .extended,
-    });
-    try extended_pipeline.query("select 7 as n");
-    try extended_pipeline.query("select 'pipe' as label");
+    var extended_pipeline = conn.pipeline();
+    try Db.stmt.pipeline_number.queue(&extended_pipeline, .{});
+    try Db.stmt.pipeline_label.queue(&extended_pipeline, .{});
     try extended_pipeline.flush();
 
     var e1 = try extended_pipeline.readQuery(std.testing.allocator);
@@ -114,21 +162,10 @@ test "pool query against local postgres" {
     defer e2.deinit();
     try std.testing.expectEqualStrings("pipe", e2.rows[0].get(0).?);
 
-    var parameter_pipeline = conn.pipeline(.{
-        .protocol = .extended,
-    });
-    var prepared_for_pipeline = try conn.prepare(std.testing.allocator, "select $1::text as prepared_label");
-    defer prepared_for_pipeline.deinit();
-    try parameter_pipeline.queryValues(std.testing.allocator, "select $1::text as label, $2::int4 as n", &.{
-        .{ .text = "param-pipe" },
-        .{ .int4 = 29 },
-    });
-    try parameter_pipeline.execValues(std.testing.allocator, "select $1::int4", &.{
-        .{ .int4 = 31 },
-    });
-    try parameter_pipeline.preparedQueryValues(std.testing.allocator, prepared_for_pipeline.name, &.{
-        .{ .text = "prepared-pipe" },
-    });
+    var parameter_pipeline = conn.pipeline();
+    try Db.stmt.parameter_pipeline.queue(&parameter_pipeline, .{ "param-pipe", @as(i32, 29) });
+    try Db.stmt.parameter_pipeline_exec.queue(&parameter_pipeline, .{@as(i32, 31)});
+    try Db.stmt.prepared_pipeline_label.queue(&parameter_pipeline, .{"prepared-pipe"});
     try parameter_pipeline.flush();
 
     var pv1 = try parameter_pipeline.readQuery(std.testing.allocator);
@@ -144,105 +181,84 @@ test "pool query against local postgres" {
     defer pv2.deinit();
     try std.testing.expectEqualStrings("prepared-pipe", pv2.rows[0].get(0).?);
 
-    const StaticConnQuery = zpg.CompiledQuery(
-        "select 'compiled' as status, 11::int4 as n",
-        struct {},
-        struct {
-            status: []const u8,
-            n: i32,
-        },
-    );
-    var static_conn = try StaticConnQuery.query(conn, std.testing.allocator, .{});
+    var static_conn = try Db.stmt.static_conn.query(conn, std.testing.allocator, .{});
     defer static_conn.deinit();
     try std.testing.expectEqualStrings("compiled", static_conn.rows[0].status);
     try std.testing.expectEqual(@as(i32, 11), static_conn.rows[0].n);
 
-    var direct_param = try conn.queryValues(std.testing.allocator, "select $1::text as status, $2::int4 as n", &.{
-        .{ .text = "direct" },
-        .{ .int4 = 17 },
-    }, .{});
-    defer direct_param.deinit();
-    try std.testing.expectEqualStrings("direct", direct_param.rows[0].get(0).?);
-    try std.testing.expectEqualStrings("17", direct_param.rows[0].get(1).?);
-
-    const type_conn = try zpg.Conn.connect(std.testing.allocator, std.testing.io, &cfg);
+    const TypesDb = zpg.Statements(.{
+        .set_tz = zpg.statement("set_tz", "set time zone 'UTC'", struct {}, struct {}),
+        .text_types = zpg.statement(
+            "text_types",
+            \\select
+            \\  '550e8400-e29b-41d4-a716-446655440000'::uuid as uuid_v,
+            \\  date '2026-03-18' as d,
+            \\  time '12:34:56.789012' as t,
+            \\  timestamp '2026-03-18 12:34:56.789012' as ts,
+            \\  timestamptz '2026-03-18 12:34:56.789012+05:30' as tstz,
+            \\  '{"kind":"json"}'::json as j,
+            \\  '{"kind":"jsonb"}'::jsonb as jb
+            ,
+            struct {},
+            struct {
+                uuid_v: [16]u8,
+                d: zpg.Date,
+                t: zpg.Time,
+                ts: zpg.Timestamp,
+                tstz: zpg.Timestamp,
+                j: []const u8,
+                jb: []const u8,
+            },
+        ),
+    });
+    const type_conn = try TypesDb.connect(std.testing.allocator, std.testing.io, &cfg);
     defer type_conn.destroy();
-    const type_tz_tag = try type_conn.exec(std.testing.allocator, "set time zone 'UTC'");
+    const type_tz_tag = try TypesDb.stmt.set_tz.exec(type_conn, std.testing.allocator, .{});
     defer std.testing.allocator.free(type_tz_tag);
 
-    var text_types = try type_conn.query(std.testing.allocator,
-        \\select
-        \\  '550e8400-e29b-41d4-a716-446655440000'::uuid as uuid_v,
-        \\  date '2026-03-18' as d,
-        \\  time '12:34:56.789012' as t,
-        \\  timestamp '2026-03-18 12:34:56.789012' as ts,
-        \\  timestamptz '2026-03-18 12:34:56.789012+05:30' as tstz,
-        \\  '{"kind":"json"}'::json as j,
-        \\  '{"kind":"jsonb"}'::jsonb as jb
-    );
+    var text_types = try TypesDb.stmt.text_types.query(type_conn, std.testing.allocator, .{});
     defer text_types.deinit();
-    try std.testing.expectEqual(@as(usize, 7), text_types.rows[0].values.len);
     try std.testing.expectEqualSlices(u8, &.{
         0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
         0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
-    }, &(try text_types.decode(0, 0, [16]u8)).?);
-    try std.testing.expectEqual(zpg.Date{ .year = 2026, .month = 3, .day = 18 }, (try text_types.decode(0, 1, zpg.Date)).?);
-    try std.testing.expectEqual(zpg.Time{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 }, (try text_types.decode(0, 2, zpg.Time)).?);
+    }, &text_types.rows[0].uuid_v);
+    try std.testing.expectEqual(zpg.Date{ .year = 2026, .month = 3, .day = 18 }, text_types.rows[0].d);
+    try std.testing.expectEqual(zpg.Time{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 }, text_types.rows[0].t);
     try std.testing.expectEqual(zpg.Timestamp{
         .date = .{ .year = 2026, .month = 3, .day = 18 },
         .time = .{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 },
-    }, (try text_types.decode(0, 3, zpg.Timestamp)).?);
+    }, text_types.rows[0].ts);
     try std.testing.expectEqual(zpg.Timestamp{
         .date = .{ .year = 2026, .month = 3, .day = 18 },
         .time = .{ .hour = 7, .minute = 4, .second = 56, .microsecond = 789012 },
-    }, (try text_types.decode(0, 4, zpg.Timestamp)).?);
-    try std.testing.expectEqualStrings("{\"kind\":\"json\"}", (try text_types.decode(0, 5, []const u8)).?);
-    try std.testing.expectEqualStrings("{\"kind\": \"jsonb\"}", (try text_types.decode(0, 6, []const u8)).?);
+    }, text_types.rows[0].tstz);
+    try std.testing.expectEqualStrings("{\"kind\":\"json\"}", text_types.rows[0].j);
+    try std.testing.expectEqualStrings("{\"kind\": \"jsonb\"}", text_types.rows[0].jb);
 
-    const StaticParamQuery = zpg.CompiledQuery(
-        "select $1::text as status, $2::int4 as n",
-        struct { []const u8, i32 },
-        struct {
-            status: []const u8,
-            n: i32,
-        },
-    );
-    var static_param = try StaticParamQuery.query(conn, std.testing.allocator, .{ "typed", 19 });
+    var static_param = try Db.stmt.static_param.query(conn, std.testing.allocator, .{ "typed", 19 });
     defer static_param.deinit();
     try std.testing.expectEqualStrings("typed", static_param.rows[0].status);
     try std.testing.expectEqual(@as(i32, 19), static_param.rows[0].n);
 
-    const static_tag = try StaticParamQuery.exec(conn, std.testing.allocator, .{ "exec", 23 });
+    const static_tag = try Db.stmt.static_param.exec(conn, std.testing.allocator, .{ "exec", 23 });
     defer std.testing.allocator.free(static_tag);
     try std.testing.expectEqualStrings("SELECT 1", static_tag);
 
-    var compiled_pipeline = conn.pipeline(.{
-        .protocol = .extended,
-    });
-    try StaticParamQuery.queue(&compiled_pipeline, std.testing.allocator, .{ "compiled-pipe-1", 37 });
-    try StaticParamQuery.queue(&compiled_pipeline, std.testing.allocator, .{ "compiled-pipe-2", 41 });
+    var compiled_pipeline = conn.pipeline();
+    try Db.stmt.static_param.queue(&compiled_pipeline, .{ "compiled-pipe-1", 37 });
+    try Db.stmt.static_param.queue(&compiled_pipeline, .{ "compiled-pipe-2", 41 });
     try compiled_pipeline.flush();
 
-    var cp1 = try StaticParamQuery.read(&compiled_pipeline, std.testing.allocator);
+    var cp1 = try Db.stmt.static_param.read(&compiled_pipeline, std.testing.allocator);
     defer cp1.deinit();
     try std.testing.expectEqualStrings("compiled-pipe-1", cp1.rows[0].status);
     try std.testing.expectEqual(@as(i32, 37), cp1.rows[0].n);
 
-    var cp2 = try StaticParamQuery.read(&compiled_pipeline, std.testing.allocator);
+    var cp2 = try Db.stmt.static_param.read(&compiled_pipeline, std.testing.allocator);
     defer cp2.deinit();
     try std.testing.expectEqualStrings("compiled-pipe-2", cp2.rows[0].status);
     try std.testing.expectEqual(@as(i32, 41), cp2.rows[0].n);
 
-    const TemporalParamQuery = zpg.CompiledQuery(
-        "select $1::uuid as uuid_v, $2::date as d, $3::time as t, $4::timestamp as ts",
-        struct { [16]u8, zpg.Date, zpg.Time, zpg.Timestamp },
-        struct {
-            uuid_v: [16]u8,
-            d: zpg.Date,
-            t: zpg.Time,
-            ts: zpg.Timestamp,
-        },
-    );
     const uuid_v = [16]u8{
         0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
         0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
@@ -253,12 +269,19 @@ test "pool query against local postgres" {
         .date = .{ .year = 2026, .month = 3, .day = 18 },
         .time = .{ .hour = 12, .minute = 34, .second = 56, .microsecond = 789012 },
     };
-    var temporal = try TemporalParamQuery.query(conn, std.testing.allocator, .{ uuid_v, date_v, time_v, ts_v });
+    var temporal = try Db.stmt.temporal_param.query(conn, std.testing.allocator, .{ uuid_v, date_v, time_v, ts_v });
     defer temporal.deinit();
     try std.testing.expectEqualSlices(u8, &uuid_v, &temporal.rows[0].uuid_v);
     try std.testing.expectEqual(date_v, temporal.rows[0].d);
     try std.testing.expectEqual(time_v, temporal.rows[0].t);
     try std.testing.expectEqual(ts_v, temporal.rows[0].ts);
+
+    const prepared_conn = try Db.connect(std.testing.allocator, std.testing.io, &cfg);
+    defer prepared_conn.destroy();
+    var prepared_compiled = try Db.stmt.static_param.query(prepared_conn, std.testing.allocator, .{ "prewarmed", 73 });
+    defer prepared_compiled.deinit();
+    try std.testing.expectEqualStrings("prewarmed", prepared_compiled.rows[0].status);
+    try std.testing.expectEqual(@as(i32, 73), prepared_compiled.rows[0].n);
 }
 
 test "tls query against docker postgres" {
@@ -279,20 +302,35 @@ test "tls query against docker postgres" {
     };
     defer pool.deinit();
 
-    var result = pool.queryValues(std.testing.allocator, "select $1::int4 + 2 as n, $2::text as label", &.{
-        .{ .int4 = 5 },
-        .{ .text = "tls" },
-    }, .{
-        .result_format = .binary,
-    }) catch |err| {
+    const TlsDb = zpg.Statements(.{
+        .tls_query = zpg.statement(
+            "tls_query",
+            "select $1::int4 + 2 as n, $2::text as label",
+            struct { i32, []const u8 },
+            struct { n: i32, label: []const u8 },
+        ),
+        .secure_label = zpg.statement(
+            "secure_label",
+            "select $1::text as secure_label",
+            struct { []const u8 },
+            struct { secure_label: []const u8 },
+        ),
+    });
+    const tls_conn = pool.acquire() catch |err| {
+        if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
+        try reportDockerTlsFailure("acquire failed", err, pg.container_name);
+        return err;
+    };
+    defer pool.release(tls_conn);
+    try TlsDb.prepare(tls_conn);
+    var result = TlsDb.stmt.tls_query.query(tls_conn, std.testing.allocator, .{ @as(i32, 5), "tls" }) catch |err| {
         if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
         try reportDockerTlsFailure("query failed", err, pg.container_name);
         return err;
     };
     defer result.deinit();
-
-    try std.testing.expectEqual(@as(i32, 7), (try result.decodeByName(0, "n", i32)).?);
-    try std.testing.expectEqualStrings("tls", (try result.decodeByName(0, "label", []const u8)).?);
+    try std.testing.expectEqual(@as(i32, 7), result.rows[0].n);
+    try std.testing.expectEqualStrings("tls", result.rows[0].label);
 
     var cfg = try zpg.Config.parseUri(std.testing.allocator, url);
     defer cfg.deinit(std.testing.allocator);
@@ -303,13 +341,10 @@ test "tls query against docker postgres" {
     };
     defer conn.destroy();
 
-    var stmt = try conn.prepare(std.testing.allocator, "select $1::text as secure_label");
-    defer stmt.deinit();
-    var prepared = try stmt.queryValues(std.testing.allocator, &.{.{ .text = "prepared-tls" }}, .{
-        .result_format = .binary,
-    });
+    try TlsDb.prepare(conn);
+    var prepared = try TlsDb.stmt.secure_label.query(conn, std.testing.allocator, .{"prepared-tls"});
     defer prepared.deinit();
-    try std.testing.expectEqualStrings("prepared-tls", (try prepared.decodeByName(0, "secure_label", []const u8)).?);
+    try std.testing.expectEqualStrings("prepared-tls", prepared.rows[0].secure_label);
 }
 
 test "docker postgres requiring client cert currently fails with std tls client" {
