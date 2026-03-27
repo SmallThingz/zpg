@@ -2,11 +2,13 @@ const std = @import("std");
 const zpg = @import("zpg");
 
 const DockerMode = enum {
+    plain,
     tls,
     mtls_required,
 
     fn arg(mode: DockerMode) []const u8 {
         return switch (mode) {
+            .plain => "plain",
             .tls => "tls",
             .mtls_required => "mtls-required",
         };
@@ -16,6 +18,8 @@ const DockerMode = enum {
 const DockerPg = struct {
     root: []u8,
     ca_cert_path: []u8,
+    client_cert_path: []u8,
+    client_key_path: []u8,
     container_name: []u8,
     port: u16,
 
@@ -25,6 +29,8 @@ const DockerPg = struct {
         cwd.deleteTree(std.testing.io, pg.root) catch {};
         std.testing.allocator.free(pg.root);
         std.testing.allocator.free(pg.ca_cert_path);
+        std.testing.allocator.free(pg.client_cert_path);
+        std.testing.allocator.free(pg.client_key_path);
         std.testing.allocator.free(pg.container_name);
     }
 };
@@ -35,28 +41,13 @@ test {
 
 test "pool query against local postgres" {
     if (!std.process.can_spawn) return error.SkipZigTest;
-    if (!haveExecutable("/usr/bin/initdb")) return error.SkipZigTest;
-    if (!haveExecutable("/usr/bin/pg_ctl")) return error.SkipZigTest;
+    if (!dockerUsable()) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var pg = try startDockerPg(.plain);
+    defer pg.deinit();
 
-    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
-    defer std.testing.allocator.free(cwd);
-
-    const root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, &tmp.sub_path });
-    defer std.testing.allocator.free(root);
-    const data_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/pgdata", .{root});
-    defer std.testing.allocator.free(data_dir);
-    const port = 55000 + (@as(u16, tmp.sub_path[0]) << 2) + @as(u16, tmp.sub_path[1] % 200);
-    const options = try std.fmt.allocPrint(std.testing.allocator, "-k /tmp -p {d}", .{port});
-    defer std.testing.allocator.free(options);
-    const url = try std.fmt.allocPrint(std.testing.allocator, "postgres://postgres@127.0.0.1:{d}/postgres?sslmode=disable", .{port});
+    const url = try std.fmt.allocPrint(std.testing.allocator, "postgres://postgres@localhost:{d}/postgres?sslmode=disable", .{pg.port});
     defer std.testing.allocator.free(url);
-
-    try spawnExpectSuccess(&.{ "/usr/bin/initdb", "-D", data_dir, "--auth=trust", "--username=postgres" });
-    try spawnExpectSuccess(&.{ "/usr/bin/pg_ctl", "-D", data_dir, "-o", options, "-w", "start" });
-    defer spawnExpectSuccess(&.{ "/usr/bin/pg_ctl", "-D", data_dir, "-m", "immediate", "-w", "stop" }) catch {};
 
     var pool = try zpg.Pool.initUri(std.testing.allocator, std.testing.io, url, 2);
     defer pool.deinit();
@@ -296,7 +287,6 @@ test "tls query against docker postgres" {
     defer std.testing.allocator.free(url);
 
     var pool = zpg.Pool.initUri(std.testing.allocator, std.testing.io, url, 2) catch |err| {
-        if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
         try reportDockerTlsFailure("pool init failed", err, pg.container_name);
         return err;
     };
@@ -317,14 +307,12 @@ test "tls query against docker postgres" {
         ),
     });
     const tls_conn = pool.acquire() catch |err| {
-        if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
         try reportDockerTlsFailure("acquire failed", err, pg.container_name);
         return err;
     };
     defer pool.release(tls_conn);
     try TlsDb.prepare(tls_conn);
     var result = TlsDb.stmt.tls_query.query(tls_conn, std.testing.allocator, .{ @as(i32, 5), "tls" }) catch |err| {
-        if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
         try reportDockerTlsFailure("query failed", err, pg.container_name);
         return err;
     };
@@ -335,7 +323,6 @@ test "tls query against docker postgres" {
     var cfg = try zpg.Config.parseUri(std.testing.allocator, url);
     defer cfg.deinit(std.testing.allocator);
     const conn = zpg.Conn.connect(std.testing.allocator, std.testing.io, &cfg) catch |err| {
-        if (isKnownStdTlsInteropError(err)) return error.SkipZigTest;
         try reportDockerTlsFailure("connect failed", err, pg.container_name);
         return err;
     };
@@ -345,9 +332,29 @@ test "tls query against docker postgres" {
     var prepared = try TlsDb.stmt.secure_label.query(conn, std.testing.allocator, .{"prepared-tls"});
     defer prepared.deinit();
     try std.testing.expectEqualStrings("prepared-tls", prepared.rows[0].secure_label);
+    
+    const mtls_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "postgres://postgres@localhost:{d}/postgres?sslmode=verify-full&sslrootcert={s}&sslcert={s}&sslkey={s}",
+        .{ pg.port, pg.ca_cert_path, pg.client_cert_path, pg.client_key_path },
+    );
+    defer std.testing.allocator.free(mtls_url);
+
+    var mtls_cfg = try zpg.Config.parseUri(std.testing.allocator, mtls_url);
+    defer mtls_cfg.deinit(std.testing.allocator);
+    const mtls_conn = zpg.Conn.connect(std.testing.allocator, std.testing.io, &mtls_cfg) catch |err| {
+        try reportDockerTlsFailure("mTLS connect failed", err, pg.container_name);
+        return err;
+    };
+    defer mtls_conn.destroy();
+
+    try TlsDb.prepare(mtls_conn);
+    var mtls_result = try TlsDb.stmt.secure_label.query(mtls_conn, std.testing.allocator, .{"mutual-tls"});
+    defer mtls_result.deinit();
+    try std.testing.expectEqualStrings("mutual-tls", mtls_result.rows[0].secure_label);
 }
 
-test "docker postgres requiring client cert currently fails with std tls client" {
+test "docker postgres requiring client cert succeeds with configured client auth" {
     if (!std.process.can_spawn) return error.SkipZigTest;
     if (!dockerUsable()) return error.SkipZigTest;
     if (!haveExecutable("/usr/bin/openssl")) return error.SkipZigTest;
@@ -355,37 +362,35 @@ test "docker postgres requiring client cert currently fails with std tls client"
     var pg = try startDockerPg(.mtls_required);
     defer pg.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "postgres://postgres@localhost:{d}/postgres?sslmode=verify-full&sslrootcert={s}", .{ pg.port, pg.ca_cert_path });
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "postgres://postgres@localhost:{d}/postgres?sslmode=verify-full&sslrootcert={s}&sslcert={s}&sslkey={s}",
+        .{ pg.port, pg.ca_cert_path, pg.client_cert_path, pg.client_key_path },
+    );
     defer std.testing.allocator.free(url);
 
     var cfg = try zpg.Config.parseUri(std.testing.allocator, url);
     defer cfg.deinit(std.testing.allocator);
 
-    if (zpg.Conn.connect(std.testing.allocator, std.testing.io, &cfg)) |conn| {
-        defer conn.destroy();
-        std.debug.print("docker logs for unexpected mTLS success:\n{s}\n", .{try dockerLogsAlloc(pg.container_name)});
-        return error.UnexpectedTestSuccess;
-    } else |err| {
-        const e: anyerror = err;
-        switch (e) {
-            error.TlsAlert,
-            error.TlsAlertHandshakeFailure,
-            error.TlsAlertCertificateRequired,
-            error.TlsConnectionTruncated,
-            error.TlsCertificateNotVerified,
-            error.TlsUnexpectedMessage,
-            error.ReadFailed,
-            error.EndOfStream,
-            error.ConnectionResetByPeer,
-            => {},
-            else => {
-                const logs = try dockerLogsAlloc(pg.container_name);
-                defer std.testing.allocator.free(logs);
-                std.debug.print("unexpected mTLS failure: {s}\ndocker logs:\n{s}\n", .{ @errorName(e), logs });
-                return err;
-            },
-        }
-    }
+    const Db = zpg.Statements(.{
+        .whoami = zpg.statement(
+            "whoami",
+            "select current_user as whoami",
+            struct {},
+            struct { whoami: []const u8 },
+        ),
+    });
+
+    const conn = zpg.Conn.connect(std.testing.allocator, std.testing.io, &cfg) catch |err| {
+        try reportDockerTlsFailure("mTLS connect failed", err, pg.container_name);
+        return err;
+    };
+    defer conn.destroy();
+
+    try Db.prepare(conn);
+    var result = try Db.stmt.whoami.query(conn, std.testing.allocator, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("postgres", result.rows[0].whoami);
 }
 
 fn haveExecutable(path: []const u8) bool {
@@ -410,24 +415,42 @@ fn startDockerPg(mode: DockerMode) !DockerPg {
     errdefer std.testing.allocator.free(root);
     const ca_cert_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/tls/ca.crt", .{root});
     errdefer std.testing.allocator.free(ca_cert_path);
+    const client_cert_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/tls/client.crt", .{root});
+    errdefer std.testing.allocator.free(client_cert_path);
+    const client_key_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/tls/client.key", .{root});
+    errdefer std.testing.allocator.free(client_key_path);
     const container_name = try std.fmt.allocPrint(std.testing.allocator, "zpg-{s}", .{&tmp.sub_path});
     errdefer std.testing.allocator.free(container_name);
-    const port = 57000 + (@as(u16, tmp.sub_path[0]) << 2) + @as(u16, tmp.sub_path[1] % 200);
-    const port_text = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{port});
-    defer std.testing.allocator.free(port_text);
     const script = try std.fmt.allocPrint(std.testing.allocator, "{s}/scripts/pg-docker-tls.sh", .{cwd});
     defer std.testing.allocator.free(script);
+    const seed = std.hash.Wyhash.hash(0, &tmp.sub_path);
+    for (0..32) |attempt| {
+        const port_offset: u16 = @intCast((seed +% attempt) % (65535 - 49152));
+        const port: u16 = 49152 + port_offset;
+        const port_text = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{port});
+        defer std.testing.allocator.free(port_text);
 
-    try spawnExpectSuccess(&.{ "/usr/bin/bash", script, root, container_name, port_text, mode.arg() });
-    errdefer _ = spawnExitCode(&.{ "/usr/bin/docker", "rm", "-f", container_name }) catch 0;
-    try waitForDockerReady(container_name);
+        const exit_code = try spawnExitCode(&.{ "/usr/bin/bash", script, root, container_name, port_text, mode.arg() });
+        if (exit_code != 0) continue;
+        errdefer _ = spawnExitCode(&.{ "/usr/bin/docker", "rm", "-f", container_name }) catch 0;
+        waitForDockerReady(container_name) catch |err| switch (err) {
+            error.UnexpectedExit, error.Timeout => {
+                _ = spawnExitCode(&.{ "/usr/bin/docker", "rm", "-f", container_name }) catch 0;
+                continue;
+            },
+            else => return err,
+        };
 
-    return .{
-        .root = root,
-        .ca_cert_path = ca_cert_path,
-        .container_name = container_name,
-        .port = port,
-    };
+        return .{
+            .root = root,
+            .ca_cert_path = ca_cert_path,
+            .client_cert_path = client_cert_path,
+            .client_key_path = client_key_path,
+            .container_name = container_name,
+            .port = port,
+        };
+    }
+    return error.NoAvailableDockerPort;
 }
 
 fn waitForDockerReady(container_name: []const u8) !void {
@@ -469,15 +492,6 @@ fn reportDockerTlsFailure(context: []const u8, err: anyerror, container_name: []
     const logs = try dockerLogsAlloc(container_name);
     defer std.testing.allocator.free(logs);
     std.debug.print("{s}: {s}\ndocker logs:\n{s}\n", .{ context, @errorName(err), logs });
-}
-
-fn isKnownStdTlsInteropError(err: anyerror) bool {
-    return switch (err) {
-        error.TlsUnexpectedMessage,
-        error.EndOfStream,
-        => true,
-        else => false,
-    };
 }
 
 fn spawnExpectSuccess(argv: []const []const u8) !void {

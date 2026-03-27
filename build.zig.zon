@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x5aceb9991a5799b2, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0-dev.2736+3b515fbed",
-    .dependencies = .{},
+    .dependencies = .{
+        .tls = .{
+            .url = "git+https://github.com/ianic/tls.zig#0e6ffd58f75832647fbcc94977cc0d7880c894dc",
+            .hash = "tls-0.1.0-ER2e0lWpBQBMRW-oQxwuf5xqwPGor7Vs_W_xQdUHx7Qu",
+        },
+    },
     .paths = .{
         "README.md",
         "build.zig",

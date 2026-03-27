@@ -1,10 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const tls = @import("tls");
 const Config = @import("config.zig").Config;
 const proto = @import("proto.zig");
 const scram = @import("scram.zig");
-const TlsClient = std.crypto.tls.Client;
-const TlsHost = @FieldType(TlsClient.Options, "host");
-const TlsCa = @FieldType(TlsClient.Options, "ca");
+const TlsConn = tls.Connection;
+const TlsBundle = tls.config.cert.Bundle;
+const TlsCertKeyPair = tls.config.CertKeyPair;
 
 comptime {
     @setEvalBranchQuota(30000);
@@ -237,14 +239,19 @@ pub const Pipeline = struct {
 const TlsState = struct {
     base_reader: std.Io.net.Stream.Reader,
     base_writer: std.Io.net.Stream.Writer,
-    client: TlsClient,
+    conn: TlsConn,
+    reader: TlsConn.Reader,
+    writer: TlsConn.Writer,
+    rng: std.Random.DefaultCsprng,
     read_buffer: []u8,
     write_buffer: []u8,
-    ca_bundle: ?std.crypto.Certificate.Bundle = null,
+    root_ca: ?TlsBundle = null,
+    auth: ?TlsCertKeyPair = null,
 
     fn deinit(state: *TlsState, allocator: std.mem.Allocator) void {
-        state.client.end() catch {};
-        if (state.ca_bundle) |*bundle| bundle.deinit(allocator);
+        state.conn.close() catch {};
+        if (state.auth) |*auth| auth.deinit(allocator);
+        if (state.root_ca) |*bundle| bundle.deinit(allocator);
         allocator.free(state.read_buffer);
         allocator.free(state.write_buffer);
         allocator.destroy(state);
@@ -334,8 +341,8 @@ pub const Conn = struct {
         defer out.deinit(allocator);
         proto.appendTerminate(&out, allocator) catch {};
         conn.writeMessages(out.items) catch {};
-        if (conn.tls) |tls| {
-            tls.deinit(allocator);
+        if (conn.tls) |tls_state| {
+            tls_state.deinit(allocator);
             conn.tls = null;
         }
         conn.stream.close(conn.io);
@@ -1206,7 +1213,7 @@ pub const Conn = struct {
 
     fn currentReader(conn: *Conn) *std.Io.Reader {
         if (conn.reader_override) |*reader| return reader;
-        if (conn.tls) |tls| return &tls.client.reader;
+        if (conn.tls) |tls_state| return &tls_state.reader.interface;
         return &conn.reader.interface;
     }
 
@@ -1221,10 +1228,10 @@ pub const Conn = struct {
         std.mem.writeInt(u32, header[1..5], @as(u32, @intCast(sql.len + 5)), .big);
         const zero = [_]u8{0};
 
-        if (conn.tls) |tls| {
-            try tls.client.writer.writeAll(&header);
-            try tls.client.writer.writeAll(sql);
-            try tls.client.writer.writeAll(&zero);
+        if (conn.tls) |tls_state| {
+            try tls_state.writer.interface.writeAll(&header);
+            try tls_state.writer.interface.writeAll(sql);
+            try tls_state.writer.interface.writeAll(&zero);
             return;
         }
 
@@ -1235,15 +1242,15 @@ pub const Conn = struct {
 
     fn flushWrites(conn: *Conn) !void {
         if (conn.queued_writes.items.len != 0) {
-            if (conn.tls) |tls| {
-                try tls.client.writer.writeAll(conn.queued_writes.items);
+            if (conn.tls) |tls_state| {
+                try tls_state.writer.interface.writeAll(conn.queued_writes.items);
             } else {
                 try conn.writer.interface.writeAll(conn.queued_writes.items);
             }
             conn.queued_writes.clearRetainingCapacity();
         }
-        if (conn.tls) |tls| {
-            try tls.client.writer.flush();
+        if (conn.tls) |tls_state| {
+            try tls_state.writer.interface.flush();
             return;
         }
         try conn.writer.interface.flush();
@@ -1282,73 +1289,63 @@ pub const Conn = struct {
     }
 
     fn enableTls(conn: *Conn) !void {
-        const tls = try conn.allocator.create(TlsState);
-        tls.* = .{
+        const tls_state = try conn.allocator.create(TlsState);
+        tls_state.* = .{
             .base_reader = undefined,
             .base_writer = undefined,
-            .client = undefined,
+            .conn = undefined,
+            .reader = undefined,
+            .writer = undefined,
+            .rng = undefined,
             .read_buffer = &.{},
             .write_buffer = &.{},
-            .ca_bundle = null,
+            .root_ca = null,
+            .auth = null,
         };
         var tls_initialized = false;
         errdefer if (tls_initialized) {
-            tls.deinit(conn.allocator);
+            tls_state.deinit(conn.allocator);
         } else {
-            if (tls.ca_bundle) |*bundle| bundle.deinit(conn.allocator);
-            if (tls.read_buffer.len != 0) conn.allocator.free(tls.read_buffer);
-            if (tls.write_buffer.len != 0) conn.allocator.free(tls.write_buffer);
-            conn.allocator.destroy(tls);
+            if (tls_state.auth) |*auth| auth.deinit(conn.allocator);
+            if (tls_state.root_ca) |*bundle| bundle.deinit(conn.allocator);
+            if (tls_state.read_buffer.len != 0) conn.allocator.free(tls_state.read_buffer);
+            if (tls_state.write_buffer.len != 0) conn.allocator.free(tls_state.write_buffer);
+            conn.allocator.destroy(tls_state);
         };
 
-        tls.read_buffer = try conn.allocator.alloc(u8, TlsClient.min_buffer_len);
-        tls.write_buffer = try conn.allocator.alloc(u8, TlsClient.min_buffer_len);
+        tls_state.read_buffer = try conn.allocator.alloc(u8, networkBufferLen(conn.config));
+        tls_state.write_buffer = try conn.allocator.alloc(u8, networkBufferLen(conn.config));
 
-        const now = std.Io.Timestamp.now(conn.io, .real);
-        const ca: TlsCa = switch (conn.config.ssl_mode) {
-            .require => .no_verification,
-            .verify_ca, .verify_full => blk: {
-                var bundle: std.crypto.Certificate.Bundle = .{};
-                errdefer bundle.deinit(conn.allocator);
-                if (conn.config.ssl_root_cert) |path| {
-                    try bundle.addCertsFromFilePathAbsolute(conn.allocator, conn.io, now, path);
-                } else {
-                    try bundle.rescan(conn.allocator, conn.io, now);
-                }
-                tls.ca_bundle = bundle;
-                break :blk .{ .bundle = tls.ca_bundle.? };
-            },
-            .prefer => .no_verification,
-            .disable => unreachable,
-        };
-        const host: TlsHost = switch (conn.config.ssl_mode) {
-            .verify_full => .{ .explicit = conn.config.host },
-            else => .no_verification,
-        };
+        tls_state.base_reader = conn.stream.reader(conn.io, conn.read_buffer);
+        tls_state.base_writer = conn.stream.writer(conn.io, conn.write_buffer);
+        const now = std.Io.Clock.real.now(conn.io);
+        var tls_seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+        try fillSecureRandom(conn.io, &tls_seed);
+        tls_state.rng = std.Random.DefaultCsprng.init(tls_seed);
 
-        tls.base_reader = conn.stream.reader(conn.io, conn.read_buffer);
-        tls.base_writer = conn.stream.writer(conn.io, conn.write_buffer);
-        var random_buffer: [TlsClient.Options.entropy_len]u8 = undefined;
-        conn.io.random(&random_buffer);
-        tls.client = TlsClient.init(
-            &tls.base_reader.interface,
-            &tls.base_writer.interface,
+        if (conn.config.ssl_mode == .verify_ca or conn.config.ssl_mode == .verify_full) {
+            tls_state.root_ca = try loadTlsBundle(conn.allocator, conn.io, conn.config.ssl_root_cert);
+        }
+        if (conn.config.ssl_cert != null or conn.config.ssl_key != null) {
+            tls_state.auth = try loadTlsClientAuth(conn.allocator, conn.io, conn.config.ssl_cert, conn.config.ssl_key);
+        }
+
+        tls_state.conn = try tls.client(
+            &tls_state.base_reader.interface,
+            &tls_state.base_writer.interface,
             .{
-                .host = host,
-                .ca = ca,
-                .read_buffer = tls.read_buffer,
-                .write_buffer = tls.write_buffer,
-                .entropy = &random_buffer,
-                .realtime_now_seconds = now.toSeconds(),
-                .allow_truncation_attacks = false,
+                .host = conn.config.host,
+                .root_ca = if (tls_state.root_ca) |root_ca| root_ca else .empty,
+                .insecure_skip_verify = conn.config.ssl_mode == .prefer or conn.config.ssl_mode == .require,
+                .auth = if (tls_state.auth) |*auth| auth else null,
+                .now = now,
+                .rng = tls_state.rng.random(),
             },
-        ) catch |err| switch (err) {
-            error.WriteFailed => return tls.base_writer.err.?,
-            error.ReadFailed => return tls.base_reader.err.?,
-            else => return err,
-        };
+        );
+        tls_state.reader = tls_state.conn.reader(tls_state.read_buffer);
+        tls_state.writer = tls_state.conn.writer(tls_state.write_buffer);
         tls_initialized = true;
-        conn.tls = tls;
+        conn.tls = tls_state;
     }
 };
 
@@ -1367,9 +1364,54 @@ fn connectStream(config: *const Config, io: std.Io) !std.Io.net.Stream {
     return address.connect(io, options);
 }
 
+fn loadTlsBundle(allocator: std.mem.Allocator, io: std.Io, maybe_path: ?[]const u8) !TlsBundle {
+    if (maybe_path) |path| {
+        if (std.fs.path.isAbsolute(path)) {
+            return tls.config.cert.fromFilePathAbsolute(allocator, io, path);
+        }
+        const dir_path = std.fs.path.dirname(path) orelse ".";
+        const file_name = std.fs.path.basename(path);
+        const dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+        return tls.config.cert.fromFilePath(allocator, io, dir, file_name);
+    }
+    return tls.config.cert.fromSystem(allocator, io);
+}
+
+fn fillSecureRandom(io: std.Io, bytes: []u8) !void {
+    switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .haiku => {
+            const file = try std.Io.Dir.openFileAbsolute(io, "/dev/urandom", .{});
+            defer file.close(io);
+            var reader_buffer: [256]u8 = undefined;
+            var reader = file.reader(io, &reader_buffer);
+            try reader.interface.readSliceAll(bytes);
+        },
+        else => @compileError("zpg TLS randomness is currently implemented for POSIX-style targets only"),
+    }
+}
+
+fn loadTlsClientAuth(allocator: std.mem.Allocator, io: std.Io, maybe_cert_path: ?[]const u8, maybe_key_path: ?[]const u8) !TlsCertKeyPair {
+    const cert_path = maybe_cert_path orelse return error.MissingTlsClientCertificate;
+    const key_path = maybe_key_path orelse return error.MissingTlsClientKey;
+    if (std.fs.path.isAbsolute(cert_path) and std.fs.path.isAbsolute(key_path)) {
+        return tls.config.CertKeyPair.fromFilePathAbsolute(allocator, io, cert_path, key_path);
+    }
+    const cert_dir_path = std.fs.path.dirname(cert_path) orelse ".";
+    const key_dir_path = std.fs.path.dirname(key_path) orelse ".";
+    if (!std.mem.eql(u8, cert_dir_path, key_dir_path)) return error.TlsClientCertAndKeyMustShareDirectory;
+    const dir = try std.Io.Dir.cwd().openDir(io, cert_dir_path, .{});
+    return tls.config.CertKeyPair.fromFilePath(
+        allocator,
+        io,
+        dir,
+        std.fs.path.basename(cert_path),
+        std.fs.path.basename(key_path),
+    );
+}
+
 fn networkBufferLen(config: *const Config) usize {
     const base = 16 * 1024;
-    return if (config.ssl_mode == .disable) base else @max(base, TlsClient.min_buffer_len);
+    return if (config.ssl_mode == .disable) base else @max(@max(base, tls.input_buffer_len), tls.output_buffer_len);
 }
 
 fn appendAssumeCapacity(out: *std.ArrayList(u8), byte: u8) void {
@@ -3262,6 +3304,8 @@ const test_config: Config = .{
     .application_name = @constCast("zpg-test"),
     .ssl_mode = .disable,
     .ssl_root_cert = null,
+    .ssl_cert = null,
+    .ssl_key = null,
     .connect_timeout_ms = 0,
     .max_message_len = 1024 * 1024,
 };

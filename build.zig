@@ -3,11 +3,17 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const tls_dep = b.dependency("tls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tls_mod = tls_dep.module("tls");
 
     const mod = b.addModule("zpg", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    mod.addImport("tls", tls_mod);
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
@@ -28,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.addArgs(&.{ "--jobs", "1" });
     run_integration_tests.step.dependOn(&run_mod_tests.step);
 
     integration_tests.step.dependOn(&mod_tests.step);

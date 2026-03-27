@@ -123,6 +123,8 @@ test "pool reuse guard rejects transaction states" {
         .application_name = try std.testing.allocator.dupe(u8, "a"),
         .ssl_mode = .disable,
         .ssl_root_cert = null,
+        .ssl_cert = null,
+        .ssl_key = null,
         .connect_timeout_ms = 0,
         .max_message_len = 1024,
     }, 1);

@@ -17,6 +17,8 @@ pub const Config = struct {
     application_name: []u8,
     ssl_mode: SslMode,
     ssl_root_cert: ?[]u8,
+    ssl_cert: ?[]u8,
+    ssl_key: ?[]u8,
     connect_timeout_ms: u32,
     max_message_len: u32,
 
@@ -44,6 +46,8 @@ pub const Config = struct {
         var max_message_len: u32 = 16 * 1024 * 1024;
         var ssl_mode: SslMode = .prefer;
         var ssl_root_cert: ?[]const u8 = null;
+        var ssl_cert: ?[]const u8 = null;
+        var ssl_key: ?[]const u8 = null;
         if (uri.query) |query| {
             const raw_query = try query.toRawMaybeAlloc(temp);
             var it = std.mem.splitScalar(u8, raw_query, '&');
@@ -62,6 +66,10 @@ pub const Config = struct {
                     ssl_mode = parseSslMode(value) orelse return error.InvalidSslMode;
                 } else if (std.mem.eql(u8, key, "sslrootcert") and value.len != 0) {
                     ssl_root_cert = value;
+                } else if (std.mem.eql(u8, key, "sslcert") and value.len != 0) {
+                    ssl_cert = value;
+                } else if (std.mem.eql(u8, key, "sslkey") and value.len != 0) {
+                    ssl_key = value;
                 }
             }
         }
@@ -74,6 +82,8 @@ pub const Config = struct {
             .application_name = try allocator.dupe(u8, application_name),
             .ssl_mode = ssl_mode,
             .ssl_root_cert = if (ssl_root_cert) |path| try allocator.dupe(u8, path) else null,
+            .ssl_cert = if (ssl_cert) |path| try allocator.dupe(u8, path) else null,
+            .ssl_key = if (ssl_key) |path| try allocator.dupe(u8, path) else null,
             .connect_timeout_ms = connect_timeout_ms,
             .max_message_len = max_message_len,
         };
@@ -86,6 +96,8 @@ pub const Config = struct {
         allocator.free(config.database);
         allocator.free(config.application_name);
         if (config.ssl_root_cert) |path| allocator.free(path);
+        if (config.ssl_cert) |path| allocator.free(path);
+        if (config.ssl_key) |path| allocator.free(path);
         config.* = undefined;
     }
 };
@@ -131,11 +143,13 @@ test "parse postgres uri root path falls back to user database" {
 }
 
 test "parse postgres uri accepts ssl modes" {
-    var cfg = try Config.parseUri(std.testing.allocator, "postgres://alice@localhost/db?sslmode=verify-full&sslrootcert=%2Ftmp%2Fca.pem");
+    var cfg = try Config.parseUri(std.testing.allocator, "postgres://alice@localhost/db?sslmode=verify-full&sslrootcert=%2Ftmp%2Fca.pem&sslcert=%2Ftmp%2Fclient.crt&sslkey=%2Ftmp%2Fclient.key");
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(Config.SslMode.verify_full, cfg.ssl_mode);
     try std.testing.expectEqualStrings("/tmp/ca.pem", cfg.ssl_root_cert.?);
+    try std.testing.expectEqualStrings("/tmp/client.crt", cfg.ssl_cert.?);
+    try std.testing.expectEqualStrings("/tmp/client.key", cfg.ssl_key.?);
 }
 
 test "parse postgres uri rejects invalid ssl mode" {

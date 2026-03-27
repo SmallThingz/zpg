@@ -12,7 +12,7 @@ PORT=$3
 MODE=$4
 
 case "$MODE" in
-  tls|mtls-required) ;;
+  plain|tls|mtls-required) ;;
   *)
     echo "invalid mode: $MODE" >&2
     exit 2
@@ -26,11 +26,15 @@ rm -rf "$ROOT_DIR"
 mkdir -p "$TLS_DIR" "$CONF_DIR" "$INIT_DIR"
 
 cat > "$TLS_DIR/server-ext.cnf" <<'CNF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
 subjectAltName=DNS:localhost,IP:127.0.0.1
 extendedKeyUsage=serverAuth
 CNF
 
 cat > "$TLS_DIR/client-ext.cnf" <<'CNF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=clientAuth
 CNF
 
@@ -38,7 +42,10 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$TLS_DIR/ca.key" \
   -out "$TLS_DIR/ca.crt" \
   -days 365 \
-  -subj '/CN=zpg test ca' >/dev/null 2>&1
+  -subj '/CN=zpg test ca' \
+  -addext 'basicConstraints=critical,CA:TRUE' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+  -addext 'subjectKeyIdentifier=hash' >/dev/null 2>&1
 
 openssl req -newkey rsa:2048 -nodes \
   -keyout "$TLS_DIR/server.key" \
@@ -71,7 +78,15 @@ openssl x509 -req \
 # mount, then lock permissions down again after copying into $PGDATA.
 chmod 644 "$TLS_DIR/server.key" "$TLS_DIR/client.key"
 
-cat > "$CONF_DIR/postgresql.conf" <<'CONF'
+if [ "$MODE" = "plain" ]; then
+  cat > "$CONF_DIR/postgresql.conf" <<'CONF'
+listen_addresses = '*'
+ssl = off
+logging_collector = off
+log_connections = on
+CONF
+else
+  cat > "$CONF_DIR/postgresql.conf" <<'CONF'
 listen_addresses = '*'
 ssl = on
 # Zig std TLS on the current toolchain does not interoperate reliably with
@@ -85,8 +100,15 @@ ssl_ca_file = 'root.crt'
 logging_collector = off
 log_connections = on
 CONF
+fi
 
-if [ "$MODE" = "tls" ]; then
+if [ "$MODE" = "plain" ]; then
+  cat > "$CONF_DIR/pg_hba.conf" <<'CONF'
+local   all             all                                     trust
+host    all             all             0.0.0.0/0               trust
+host    all             all             ::/0                    trust
+CONF
+elif [ "$MODE" = "tls" ]; then
   cat > "$CONF_DIR/pg_hba.conf" <<'CONF'
 local   all             all                                     trust
 hostnossl all           all             0.0.0.0/0               reject
