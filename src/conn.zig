@@ -333,8 +333,8 @@ pub const Conn = struct {
         defer conn.* = undefined;
         if (conn.last_error) |*err| err.deinit(allocator);
         conn.prepared_compiled_statements.deinit(allocator);
-        conn.clearUnnamedStatementCache();
-        conn.clearPipelineStatementCache();
+        clearStatementCache(conn, &conn.unnamed_statement_sql, &conn.unnamed_statement_param_types);
+        clearStatementCache(conn, &conn.pipeline_statement_sql, &conn.pipeline_statement_param_types);
         conn.queued_writes.clearRetainingCapacity();
         conn.queued_simple_pipeline_sql.clearRetainingCapacity();
         var out: std.ArrayList(u8) = .empty;
@@ -359,13 +359,13 @@ pub const Conn = struct {
 
     fn queueSimpleQuery(conn: *Conn, sql: []const u8) !void {
         conn.clearLastError();
-        conn.clearUnnamedStatementCache();
+        clearStatementCache(conn, &conn.unnamed_statement_sql, &conn.unnamed_statement_param_types);
         try conn.writeSimpleQueryBuffered(sql);
     }
 
     fn queuePipelineSimpleQuery(conn: *Conn, sql: []const u8) !void {
         conn.clearLastError();
-        conn.clearUnnamedStatementCache();
+        clearStatementCache(conn, &conn.unnamed_statement_sql, &conn.unnamed_statement_param_types);
         try conn.queued_simple_pipeline_sql.appendSlice(conn.allocator, sql);
         try conn.queued_simple_pipeline_sql.append(conn.allocator, ';');
     }
@@ -567,16 +567,6 @@ pub const Conn = struct {
         return conn.readExecResult(allocator, true);
     }
 
-    fn sendExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, params: []const proto.Param, param_types_override: ?[]const u32, result_format: proto.FormatCode, include_parse: bool) !void {
-        try conn.queueExtendedQuery(statement_name, sql, params, param_types_override, result_format, include_parse);
-        try conn.flushWrites();
-    }
-
-    fn sendCompiledExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, args: anytype, static_param_types: []const u32, result_format: proto.FormatCode, include_parse: bool) !void {
-        try conn.queueCompiledExtendedQuery(statement_name, sql, args, static_param_types, result_format, include_parse);
-        try conn.flushWrites();
-    }
-
     fn queueExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, params: []const proto.Param, param_types_override: ?[]const u32, result_format: proto.FormatCode, include_parse: bool) !void {
         const cache_unnamed = statement_name.len == 0 and include_parse;
         var param_types: []u32 = &.{};
@@ -591,7 +581,7 @@ pub const Conn = struct {
                 defer conn.allocator.free(param_types);
             }
             if (cache_unnamed) {
-                need_parse = !conn.matchesUnnamedStatement(sql, param_types);
+                need_parse = !matchesStatement(conn.unnamed_statement_sql, conn.unnamed_statement_param_types, sql, param_types);
             }
             parse_param_types = if (cache_unnamed and param_types_override == null) &.{} else param_types;
         }
@@ -604,14 +594,14 @@ pub const Conn = struct {
         try proto.appendBind(&conn.queued_writes, conn.allocator, "", statement_name, params, result_format);
         try proto.appendExecute(&conn.queued_writes, conn.allocator, "", 0);
         try proto.appendSync(&conn.queued_writes, conn.allocator);
-        if (cache_unnamed and need_parse) try conn.updateUnnamedStatementCache(sql, param_types);
+        if (cache_unnamed and need_parse) try updateStatementCache(conn, &conn.unnamed_statement_sql, &conn.unnamed_statement_param_types, sql, param_types);
     }
 
     fn queueValueExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, values: []const Value, result_format: proto.FormatCode, include_parse: bool) !void {
         const cache_unnamed = statement_name.len == 0 and include_parse;
         var need_parse = include_parse;
         if (cache_unnamed) {
-            need_parse = !conn.matchesUnnamedStatementValues(sql, values);
+            need_parse = !matchesStatementValues(conn.unnamed_statement_sql, conn.unnamed_statement_param_types, sql, values);
         }
         const parse_type_count = if (need_parse) values.len else 0;
         const start = conn.queued_writes.items.len;
@@ -623,14 +613,14 @@ pub const Conn = struct {
         try appendBindValuesAssumeCapacity(&conn.queued_writes, "", statement_name, values, result_format);
         appendExecuteAssumeCapacity(&conn.queued_writes, "", 0);
         appendSyncAssumeCapacity(&conn.queued_writes);
-        if (cache_unnamed and need_parse) try conn.updateUnnamedStatementCacheFromValues(sql, values);
+        if (cache_unnamed and need_parse) try updateStatementCacheFromValues(conn, &conn.unnamed_statement_sql, &conn.unnamed_statement_param_types, sql, values);
     }
 
     fn queueCompiledExtendedQuery(conn: *Conn, statement_name: []const u8, sql: []const u8, args: anytype, static_param_types: []const u32, result_format: proto.FormatCode, include_parse: bool) !void {
         const cache_unnamed = statement_name.len == 0 and include_parse;
         var need_parse = include_parse;
         if (cache_unnamed) {
-            need_parse = !conn.matchesUnnamedStatement(sql, static_param_types);
+            need_parse = !matchesStatement(conn.unnamed_statement_sql, conn.unnamed_statement_param_types, sql, static_param_types);
         }
         const parse_type_count = if (need_parse) static_param_types.len else 0;
         const start = conn.queued_writes.items.len;
@@ -642,7 +632,7 @@ pub const Conn = struct {
         try appendBindCompiledArgsAssumeCapacity(&conn.queued_writes, "", statement_name, args, result_format);
         appendExecuteAssumeCapacity(&conn.queued_writes, "", 0);
         appendSyncAssumeCapacity(&conn.queued_writes);
-        if (cache_unnamed and need_parse) try conn.updateUnnamedStatementCache(sql, static_param_types);
+        if (cache_unnamed and need_parse) try updateStatementCache(conn, &conn.unnamed_statement_sql, &conn.unnamed_statement_param_types, sql, static_param_types);
     }
 
     fn queuePipelineParameterizedQuery(conn: *Conn, sql: []const u8, params: []const proto.Param, param_types_override: ?[]const u32, result_format: proto.FormatCode, portal_id: u64) !void {
@@ -657,7 +647,7 @@ pub const Conn = struct {
 
         var portal_buf: [18]u8 = undefined;
         const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
-        const needs_parse = !conn.matchesPipelineStatement(sql, owned_param_types);
+        const needs_parse = !matchesStatement(conn.pipeline_statement_sql, conn.pipeline_statement_param_types, sql, owned_param_types);
 
         const start = conn.queued_writes.items.len;
         errdefer conn.queued_writes.items.len = start;
@@ -671,14 +661,14 @@ pub const Conn = struct {
         }
         try proto.appendBind(&conn.queued_writes, conn.allocator, portal_name, statement_name, params, result_format);
         try proto.appendExecute(&conn.queued_writes, conn.allocator, portal_name, 0);
-        if (needs_parse) try conn.updatePipelineStatementCache(sql, owned_param_types);
+        if (needs_parse) try updateStatementCache(conn, &conn.pipeline_statement_sql, &conn.pipeline_statement_param_types, sql, owned_param_types);
     }
 
     fn queuePipelineValueQuery(conn: *Conn, sql: []const u8, values: []const Value, result_format: proto.FormatCode, portal_id: u64) !void {
         const statement_name = "s";
         var portal_buf: [18]u8 = undefined;
         const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
-        const needs_parse = !conn.matchesPipelineStatementValues(sql, values);
+        const needs_parse = !matchesStatementValues(conn.pipeline_statement_sql, conn.pipeline_statement_param_types, sql, values);
 
         const start = conn.queued_writes.items.len;
         errdefer conn.queued_writes.items.len = start;
@@ -692,14 +682,14 @@ pub const Conn = struct {
         }
         try appendBindValuesAssumeCapacity(&conn.queued_writes, portal_name, statement_name, values, result_format);
         appendExecuteAssumeCapacity(&conn.queued_writes, portal_name, 0);
-        if (needs_parse) try conn.updatePipelineStatementCacheFromValues(sql, values);
+        if (needs_parse) try updateStatementCacheFromValues(conn, &conn.pipeline_statement_sql, &conn.pipeline_statement_param_types, sql, values);
     }
 
     fn queuePipelineCompiledQuery(conn: *Conn, sql: []const u8, args: anytype, static_param_types: []const u32, result_format: proto.FormatCode, portal_id: u64) !void {
         const statement_name = "s";
         var portal_buf: [18]u8 = undefined;
         const portal_name = try std.fmt.bufPrint(&portal_buf, "p{x}", .{portal_id});
-        const needs_parse = !conn.matchesPipelineStatement(sql, static_param_types);
+        const needs_parse = !matchesStatement(conn.pipeline_statement_sql, conn.pipeline_statement_param_types, sql, static_param_types);
 
         const start = conn.queued_writes.items.len;
         errdefer conn.queued_writes.items.len = start;
@@ -713,11 +703,7 @@ pub const Conn = struct {
         }
         try appendBindCompiledArgsAssumeCapacity(&conn.queued_writes, portal_name, statement_name, args, result_format);
         appendExecuteAssumeCapacity(&conn.queued_writes, portal_name, 0);
-        if (needs_parse) try conn.updatePipelineStatementCache(sql, static_param_types);
-    }
-
-    fn queuePipelineCachedQuery(conn: *Conn, sql: []const u8, result_format: proto.FormatCode, portal_id: u64) !void {
-        try conn.queuePipelineParameterizedQuery(sql, &.{}, &.{}, result_format, portal_id);
+        if (needs_parse) try updateStatementCache(conn, &conn.pipeline_statement_sql, &conn.pipeline_statement_param_types, sql, static_param_types);
     }
 
     fn sendCompiledExtendedExecute(conn: *Conn, statement_name: []const u8, args: anytype, result_format: proto.FormatCode) !void {
@@ -728,24 +714,6 @@ pub const Conn = struct {
     fn sendCompiledExtendedQueryExecute(conn: *Conn, statement_name: []const u8, args: anytype, result_format: proto.FormatCode) !void {
         try conn.queueCompiledExtendedQueryExecute(statement_name, args, result_format);
         try conn.flushWrites();
-    }
-
-    fn queueExtendedExecute(conn: *Conn, statement_name: []const u8, params: []const proto.Param, result_format: proto.FormatCode) !void {
-        const start = conn.queued_writes.items.len;
-        errdefer conn.queued_writes.items.len = start;
-        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, extendedExecuteMessageLenFor("", statement_name, params, true));
-        try proto.appendBind(&conn.queued_writes, conn.allocator, "", statement_name, params, result_format);
-        try proto.appendExecute(&conn.queued_writes, conn.allocator, "", 0);
-        try proto.appendSync(&conn.queued_writes, conn.allocator);
-    }
-
-    fn queueValueExtendedExecute(conn: *Conn, statement_name: []const u8, values: []const Value, result_format: proto.FormatCode) !void {
-        const start = conn.queued_writes.items.len;
-        errdefer conn.queued_writes.items.len = start;
-        try conn.queued_writes.ensureUnusedCapacity(conn.allocator, try valueExtendedExecuteMessageLenFor("", statement_name, values, true));
-        try appendBindValuesAssumeCapacity(&conn.queued_writes, "", statement_name, values, result_format);
-        appendExecuteAssumeCapacity(&conn.queued_writes, "", 0);
-        appendSyncAssumeCapacity(&conn.queued_writes);
     }
 
     fn queueCompiledExtendedExecute(conn: *Conn, statement_name: []const u8, args: anytype, result_format: proto.FormatCode) !void {
@@ -1054,25 +1022,14 @@ pub const Conn = struct {
         }
     }
 
-    fn clearUnnamedStatementCache(conn: *Conn) void {
-        if (conn.unnamed_statement_sql.len != 0) {
-            conn.allocator.free(conn.unnamed_statement_sql);
-            conn.unnamed_statement_sql = &.{};
+    fn clearStatementCache(conn: *Conn, sql_slot: *[]u8, param_types_slot: *[]u32) void {
+        if (sql_slot.*.len != 0) {
+            conn.allocator.free(sql_slot.*);
+            sql_slot.* = &.{};
         }
-        if (conn.unnamed_statement_param_types.len != 0) {
-            conn.allocator.free(conn.unnamed_statement_param_types);
-            conn.unnamed_statement_param_types = &.{};
-        }
-    }
-
-    fn clearPipelineStatementCache(conn: *Conn) void {
-        if (conn.pipeline_statement_sql.len != 0) {
-            conn.allocator.free(conn.pipeline_statement_sql);
-            conn.pipeline_statement_sql = &.{};
-        }
-        if (conn.pipeline_statement_param_types.len != 0) {
-            conn.allocator.free(conn.pipeline_statement_param_types);
-            conn.pipeline_statement_param_types = &.{};
+        if (param_types_slot.*.len != 0) {
+            conn.allocator.free(param_types_slot.*);
+            param_types_slot.* = &.{};
         }
     }
 
@@ -1080,79 +1037,38 @@ pub const Conn = struct {
         _ = try conn.prepared_compiled_statements.getOrPut(conn.allocator, statement_name);
     }
 
-    fn ensureCompiledPrepared(conn: *Conn, comptime Query: type) !void {
-        if (conn.prepared_compiled_statements.get(Query.statement_name) != null) return;
-        try conn.prepareCompiledNamedStatement(Query.statement_name, Query.sql, Query.static_param_types[0..]);
+    fn matchesStatement(cached_sql: []const u8, cached_param_types: []const u32, sql: []const u8, param_types: []const u32) bool {
+        return std.mem.eql(u8, cached_sql, sql) and std.mem.eql(u32, cached_param_types, param_types);
     }
 
-    fn matchesUnnamedStatement(conn: *const Conn, sql: []const u8, param_types: []const u32) bool {
-        return std.mem.eql(u8, conn.unnamed_statement_sql, sql) and
-            std.mem.eql(u32, conn.unnamed_statement_param_types, param_types);
-    }
-
-    fn matchesPipelineStatement(conn: *const Conn, sql: []const u8, param_types: []const u32) bool {
-        return std.mem.eql(u8, conn.pipeline_statement_sql, sql) and
-            std.mem.eql(u32, conn.pipeline_statement_param_types, param_types);
-    }
-
-    fn matchesUnnamedStatementValues(conn: *const Conn, sql: []const u8, values: []const Value) bool {
-        if (!std.mem.eql(u8, conn.unnamed_statement_sql, sql)) return false;
-        if (conn.unnamed_statement_param_types.len != values.len) return false;
-        for (values, conn.unnamed_statement_param_types) |value, expected_oid| {
+    fn matchesStatementValues(cached_sql: []const u8, cached_param_types: []const u32, sql: []const u8, values: []const Value) bool {
+        if (!std.mem.eql(u8, cached_sql, sql)) return false;
+        if (cached_param_types.len != values.len) return false;
+        for (values, cached_param_types) |value, expected_oid| {
             if (expected_oid != runtimeValueTypeOid(value)) return false;
         }
         return true;
     }
 
-    fn matchesPipelineStatementValues(conn: *const Conn, sql: []const u8, values: []const Value) bool {
-        if (!std.mem.eql(u8, conn.pipeline_statement_sql, sql)) return false;
-        if (conn.pipeline_statement_param_types.len != values.len) return false;
-        for (values, conn.pipeline_statement_param_types) |value, expected_oid| {
-            if (expected_oid != runtimeValueTypeOid(value)) return false;
+    fn updateStatementCache(conn: *Conn, sql_slot: *[]u8, param_types_slot: *[]u32, sql: []const u8, param_types: []const u32) !void {
+        clearStatementCache(conn, sql_slot, param_types_slot);
+        sql_slot.* = try conn.allocator.dupe(u8, sql);
+        errdefer {
+            conn.allocator.free(sql_slot.*);
+            sql_slot.* = &.{};
         }
-        return true;
+        param_types_slot.* = try conn.allocator.dupe(u32, param_types);
     }
 
-    fn updateUnnamedStatementCache(conn: *Conn, sql: []const u8, param_types: []const u32) !void {
-        conn.clearUnnamedStatementCache();
-        conn.unnamed_statement_sql = try conn.allocator.dupe(u8, sql);
+    fn updateStatementCacheFromValues(conn: *Conn, sql_slot: *[]u8, param_types_slot: *[]u32, sql: []const u8, values: []const Value) !void {
+        clearStatementCache(conn, sql_slot, param_types_slot);
+        sql_slot.* = try conn.allocator.dupe(u8, sql);
         errdefer {
-            conn.allocator.free(conn.unnamed_statement_sql);
-            conn.unnamed_statement_sql = &.{};
+            conn.allocator.free(sql_slot.*);
+            sql_slot.* = &.{};
         }
-        conn.unnamed_statement_param_types = try conn.allocator.dupe(u32, param_types);
-    }
-
-    fn updatePipelineStatementCache(conn: *Conn, sql: []const u8, param_types: []const u32) !void {
-        conn.clearPipelineStatementCache();
-        conn.pipeline_statement_sql = try conn.allocator.dupe(u8, sql);
-        errdefer {
-            conn.allocator.free(conn.pipeline_statement_sql);
-            conn.pipeline_statement_sql = &.{};
-        }
-        conn.pipeline_statement_param_types = try conn.allocator.dupe(u32, param_types);
-    }
-
-    fn updateUnnamedStatementCacheFromValues(conn: *Conn, sql: []const u8, values: []const Value) !void {
-        conn.clearUnnamedStatementCache();
-        conn.unnamed_statement_sql = try conn.allocator.dupe(u8, sql);
-        errdefer {
-            conn.allocator.free(conn.unnamed_statement_sql);
-            conn.unnamed_statement_sql = &.{};
-        }
-        conn.unnamed_statement_param_types = try conn.allocator.alloc(u32, values.len);
-        for (values, conn.unnamed_statement_param_types) |value, *oid| oid.* = runtimeValueTypeOid(value);
-    }
-
-    fn updatePipelineStatementCacheFromValues(conn: *Conn, sql: []const u8, values: []const Value) !void {
-        conn.clearPipelineStatementCache();
-        conn.pipeline_statement_sql = try conn.allocator.dupe(u8, sql);
-        errdefer {
-            conn.allocator.free(conn.pipeline_statement_sql);
-            conn.pipeline_statement_sql = &.{};
-        }
-        conn.pipeline_statement_param_types = try conn.allocator.alloc(u32, values.len);
-        for (values, conn.pipeline_statement_param_types) |value, *oid| oid.* = runtimeValueTypeOid(value);
+        param_types_slot.* = try conn.allocator.alloc(u32, values.len);
+        for (values, param_types_slot.*) |value, *oid| oid.* = runtimeValueTypeOid(value);
     }
 
     fn setLastError(conn: *Conn, payload: []const u8) !void {
@@ -2992,7 +2908,7 @@ test "simple query paths clear unnamed statement cache" {
     conn.unnamed_statement_param_types = try std.testing.allocator.dupe(u32, &.{23});
     conn.queued_simple_pipeline_sql = .empty;
     defer {
-        conn.clearUnnamedStatementCache();
+        Conn.clearStatementCache(&conn, &conn.unnamed_statement_sql, &conn.unnamed_statement_param_types);
         conn.queued_simple_pipeline_sql.deinit(std.testing.allocator);
     }
 
@@ -3108,7 +3024,7 @@ test "pipeline statement cache keys include parameter types" {
     conn.pipeline_statement_sql = try std.testing.allocator.dupe(u8, "select $1");
     conn.pipeline_statement_param_types = try std.testing.allocator.dupe(u32, &.{23});
     defer {
-        conn.clearPipelineStatementCache();
+        Conn.clearStatementCache(&conn, &conn.pipeline_statement_sql, &conn.pipeline_statement_param_types);
         conn.queued_writes.deinit(std.testing.allocator);
     }
 

@@ -433,7 +433,7 @@ fn startDockerPg(mode: DockerMode) !DockerPg {
         const exit_code = try spawnExitCode(&.{ "/usr/bin/bash", script, root, container_name, port_text, mode.arg() });
         if (exit_code != 0) continue;
         errdefer _ = spawnExitCode(&.{ "/usr/bin/docker", "rm", "-f", container_name }) catch 0;
-        waitForDockerReady(container_name) catch |err| switch (err) {
+        waitForDockerReady(container_name, port) catch |err| switch (err) {
             error.UnexpectedExit, error.Timeout => {
                 _ = spawnExitCode(&.{ "/usr/bin/docker", "rm", "-f", container_name }) catch 0;
                 continue;
@@ -453,7 +453,7 @@ fn startDockerPg(mode: DockerMode) !DockerPg {
     return error.NoAvailableDockerPort;
 }
 
-fn waitForDockerReady(container_name: []const u8) !void {
+fn waitForDockerReady(container_name: []const u8, port: u16) !void {
     for (0..120) |_| {
         const inspect = try std.process.run(std.testing.allocator, std.testing.io, .{
             .argv = &.{ "/usr/bin/docker", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", container_name },
@@ -468,14 +468,24 @@ fn waitForDockerReady(container_name: []const u8) !void {
             std.debug.print("docker postgres exited before ready:\n{s}\n", .{logs});
             return error.UnexpectedExit;
         }
-        const exit_code = spawnExitCode(&.{ "/usr/bin/docker", "exec", container_name, "pg_isready", "-U", "postgres" }) catch 1;
-        if (exit_code == 0) return;
+        const socket_ready = (spawnExitCode(&.{ "/usr/bin/docker", "exec", container_name, "pg_isready", "-U", "postgres" }) catch 1) == 0;
+        const tcp_ready = (spawnExitCode(&.{ "/usr/bin/docker", "exec", container_name, "pg_isready", "-h", "127.0.0.1", "-U", "postgres" }) catch 1) == 0;
+        if (socket_ready and tcp_ready and hostPortAcceptingConnections(port)) {
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake);
+            if ((spawnExitCode(&.{ "/usr/bin/docker", "exec", container_name, "pg_isready", "-h", "127.0.0.1", "-U", "postgres" }) catch 1) == 0) return;
+        }
         try std.Io.sleep(std.testing.io, .fromMilliseconds(250), .awake);
     }
     const logs = try dockerLogsAlloc(container_name);
     defer std.testing.allocator.free(logs);
     std.debug.print("docker postgres did not become ready:\n{s}\n", .{logs});
     return error.Timeout;
+}
+
+fn hostPortAcceptingConnections(port: u16) bool {
+    const cmd = std.fmt.allocPrint(std.testing.allocator, "exec 3<>/dev/tcp/127.0.0.1/{d}", .{port}) catch return false;
+    defer std.testing.allocator.free(cmd);
+    return (spawnExitCode(&.{ "/usr/bin/bash", "-lc", cmd }) catch 1) == 0;
 }
 
 fn dockerLogsAlloc(container_name: []const u8) ![]u8 {
